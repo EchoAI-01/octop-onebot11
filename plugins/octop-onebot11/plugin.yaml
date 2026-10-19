@@ -1,0 +1,13 @@
+id: octop-onebot11
+version: 0.2.0
+name: OneBot 11 (NapCat)
+kind: channel
+entry: main.py
+description: >-
+  OneBot 11 WebSocket channel for Octop, in either direction: forward (Octop
+  dials NapCat) or reverse (NapCat dials Octop). Receives message events and
+  sends replies/actions through the OneBot 11 action API. The channel starts
+  and stays alive even when the QQ account has not logged in yet; it
+  reconnects and reports a degraded runtime status instead of failing Octop
+  startup.
+requires: []

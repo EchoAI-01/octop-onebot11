@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependency
+        run: pip install "websockets==15.0.1"
+
+      - name: Byte-compile plugins
+        run: |
+          python -m py_compile \
+            plugins/octop-onebot11/main.py \
+            plugins/octop-onebot11-tools/main.py \
+            tools/mock_napcat.py
+
+      - name: Unit checks (parsing / routing / config)
+        run: python tools/test_plugin_offline.py
+
+      - name: End-to-end checks (real WebSocket)
+        run: python tools/test_plugin_e2e.py

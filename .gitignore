@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Local notes / credentials
+NOTES.local.md
+GITHUB_SEARCH.md
+.env
+*.local.md
+*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

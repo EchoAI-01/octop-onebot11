@@ -1,0 +1,11 @@
+id: octop-onebot11-tools
+version: 0.1.0
+name: OneBot 11 Send Tools
+kind: tool
+entry: main.py
+description: >-
+  Agent tools for proactive OneBot 11 (NapCat) messages.  They reuse the live
+  channel instance registered by the octop-onebot11 channel plugin, so an agent
+  can send to an arbitrary QQ group or user without waiting for that group to
+  start a conversation first.
+requires: []
