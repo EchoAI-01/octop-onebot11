@@ -23,15 +23,35 @@ jobs:
       - name: Install test dependency
         run: pip install "websockets==15.0.1"
 
-      - name: Byte-compile plugins
-        run: |
-          python -m py_compile \
-            plugins/octop-onebot11/main.py \
-            plugins/octop-onebot11-tools/main.py \
-            tools/mock_napcat.py
+      - name: Byte-compile plugins, scripts and tools
+        run: python -m compileall -q plugins scripts tools
 
       - name: Unit checks (parsing / routing / config)
         run: python tools/test_plugin_offline.py
 
-      - name: End-to-end checks (real WebSocket)
+      - name: Regression checks (one per audit finding)
+        run: python tools/test_plugin_regression.py
+
+      - name: End-to-end checks (real WebSocket + mock NapCat)
         run: python tools/test_plugin_e2e.py
+
+  core-integration:
+    name: Octop core integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The release the plugins are verified against; bump together with the
+      # compatibility note in README.md.
+      - name: Install the real Octop gateway / harness
+        run: pip install "octop-gateway==1.0.3" "octop-harness==1.0.4" "websockets==15.0.1"
+
+      - name: Contract checks against the real core
+        env:
+          ONEBOT11_REQUIRE_CORE: "1"
+        run: python tools/test_plugin_core_integration.py

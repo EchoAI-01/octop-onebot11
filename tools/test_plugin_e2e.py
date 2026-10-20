@@ -6,15 +6,19 @@ Starts ``mock_napcat.py`` as a subprocess, loads the plugin with lightweight
 1. login detection (``get_login_info``),
 2. inbound event normalization / enqueue,
 3. outbound ``send_group_msg`` action,
-4. the no-login case keeps the channel alive with a degraded status.
+4. the no-login case keeps the channel alive with a degraded status,
+5. outbox replay, the HTTP fallback, reverse mode and multi-account mode,
+6. a NapCat that delivers but never acknowledges does not cause endless resends.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,6 +29,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import websockets
+
+# Every temp file the checks create lives under one directory that is removed
+# on exit, so a run leaves nothing behind (also on shared hosts).
+_SCRATCH = tempfile.mkdtemp(prefix="ob11-e2e-")
+tempfile.tempdir = _SCRATCH
+atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -194,7 +204,8 @@ sys.modules["octop_gateway.models"] = models_mod
 
 
 def load_plugin():
-    path = ROOT / "plugins" / "octop-onebot11" / "main.py"
+    override = os.environ.get("ONEBOT11_PLUGIN_MAIN")
+    path = Path(override) if override else ROOT / "plugins" / "octop-onebot11" / "main.py"
     spec = importlib.util.spec_from_file_location("plugin_main_e2e", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["plugin_main_e2e"] = module
@@ -209,6 +220,8 @@ def start_mock(
     logged_in: bool,
     port: int = PORT,
     http_port: int = 0,
+    test_event: bool = True,
+    no_ack_send: bool = False,
 ) -> subprocess.Popen:
     args = [
         PY,
@@ -225,7 +238,11 @@ def start_mock(
     if http_port:
         args += ["--http-port", str(http_port)]
     if logged_in:
-        args += ["--logged-in", "--send-test-after", "4"]
+        args += ["--logged-in"]
+        if test_event:
+            args += ["--send-test-after", "4"]
+    if no_ack_send:
+        args += ["--no-ack-send"]
     return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
@@ -408,6 +425,55 @@ async def scenario_http_fallback(plugin, log_path: Path):
             proc.kill()
 
 
+async def scenario_slow_ack(plugin, log_path: Path):
+    """NapCat sends but never acknowledges: resends stay bounded.
+
+    The mock executes (and logs) every ``send_*`` action without answering it,
+    i.e. the message is delivered while the plugin only sees a timeout.  The
+    outbox may retry, but never more than ``outbox_max_attempts`` sends in
+    total, and it must drop the message afterwards instead of looping.
+    """
+    port = free_port()
+    proc = start_mock(log_path, logged_in=True, port=port, test_event=False, no_ack_send=True)
+    original_interval = plugin._OUTBOX_FLUSH_INTERVAL
+    plugin._OUTBOX_FLUSH_INTERVAL = 0.2
+    try:
+        await asyncio.sleep(0.8)
+        cfg = plugin.OneBot11Config(
+            ws_url=f"ws://127.0.0.1:{port}",
+            token="dev-token",
+            group_reply_mode="mention",
+            request_timeout_seconds=0.5,
+            outbox_max_attempts=3,
+            outbox_retry_min_seconds=0.5,
+            outbox_retry_max_seconds=1.0,
+            outbox_persist_dir=tempfile.mkdtemp(),
+        )
+        channel = plugin.OneBot11Channel(
+            lambda _m: None, config=cfg, channel_id="e2e-slow-ack", tenant_id="Eous"
+        )
+        await channel.start()
+        assert await wait_connected(channel), f"not connected: {channel.runtime_error}"
+
+        await channel.push_text(plugin.build_group_subject("20002"), "无应答消息")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and channel._outbox:
+            await asyncio.sleep(0.1)
+        assert not channel._outbox, "an unacknowledged message must leave the outbox after max attempts"
+        await asyncio.sleep(1.5)  # nothing may be resent once the item is dropped
+        sends = log_path.read_text(encoding="utf-8").count("send_group_msg target=20002")
+        assert sends == 3, f"expected exactly outbox_max_attempts (3) sends, got {sends}"
+        await channel.stop()
+        print("slow-ack scenario passed")
+    finally:
+        plugin._OUTBOX_FLUSH_INTERVAL = original_interval
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -481,16 +547,20 @@ async def scenario_reverse(plugin):
     assert channel._server is not None, f"reverse listener not bound: {channel.runtime_error}"
     url = f"ws://127.0.0.1:{port}/onebot/v11/ws"
 
-    # A wrong token must be closed with policy violation 1008.
+    # websockets >= 13 refuses a wrong token with HTTP 401 before the upgrade;
+    # older releases accept the upgrade and close with policy violation 1008.
+    refusal = None
     try:
         async with websockets.connect(
             url, additional_headers={"Authorization": "Bearer wrong"}
         ) as bad:
             await asyncio.wait_for(bad.recv(), timeout=3)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - classify below
+        refusal = getattr(getattr(exc, "response", None), "status_code", None) or type(exc).__name__
     else:
         raise AssertionError("bad token must be rejected")
+    if int(websockets.__version__.split(".")[0]) >= 13:
+        assert refusal == 401, f"expected HTTP 401 before the upgrade, got {refusal!r}"
 
     async with websockets.connect(
         url,
@@ -648,6 +718,8 @@ async def main():
         await scenario_outbox(plugin, Path(tmp) / "mock-outbox.log")
     with tempfile.TemporaryDirectory() as tmp:
         await scenario_http_fallback(plugin, Path(tmp) / "mock-http.log")
+    with tempfile.TemporaryDirectory() as tmp:
+        await scenario_slow_ack(plugin, Path(tmp) / "mock-slow-ack.log")
     await scenario_reverse(plugin)
     await scenario_reverse_multi(plugin)
 

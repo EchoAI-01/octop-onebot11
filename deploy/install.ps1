@@ -1,74 +1,126 @@
 <#
 .SYNOPSIS
-    Install the Octop OneBot 11 (NapCat) channel plugin on NEC8.
+    Install the Octop OneBot 11 (NapCat) plugins into a Dockerised Octop over SSH.
 
 .DESCRIPTION
-    Uploads plugins/octop-onebot11, installs it through the Octop CLI, attaches
-    the Octop container to the MaiBot Docker network, and creates the channel.
-    NapCat does not need to be logged in for this step.
+    Windows helper for Octop running in a Docker container.  On Linux, macOS,
+    WSL or Git Bash prefer deploy/install.sh (it also handles systemd installs,
+    hot reload and post-install verification).
+
+    Steps: upload plugins/octop-onebot11 and plugins/octop-onebot11-tools to
+    the Docker host, install them with the Octop CLI inside the container,
+    optionally attach the container to the Docker network NapCat lives in, and
+    restart the container.  NapCat does not need to be logged in for this.
+
+    The script deliberately does NOT create the channel: that needs the access
+    token, and anything passed on a command line ends up in shell history and
+    process lists.  Add the channel in the dashboard (token field is a password
+    input) or follow the hints printed at the end.
+
+.PARAMETER Remote
+    SSH target of the Docker host (user@host or an ssh config alias).
+
+.PARAMETER HostUploadsDir
+    Absolute directory on the Docker host that is bind-mounted into the
+    container at ContainerUploadsDir (no spaces).
+
+.PARAMETER ContainerUploadsDir
+    Where HostUploadsDir appears inside the container.  Default: /data/.octop/uploads
+
+.PARAMETER Container
+    Octop container name.  Default: octop
+
+.PARAMETER Network
+    Optional Docker network to attach the Octop container to (the network that
+    contains NapCat), so ws://<napcat-container>:3001 resolves.
+
+.PARAMETER SkipUpload
+    Reuse the plugin files that are already on the Docker host.
+
+.PARAMETER NoRestart
+    Do not restart the container (restart or hot-reload it yourself).
 
 .EXAMPLE
-    .\install.ps1 -Token "your-napcat-ws-token"
+    .\install.ps1 -Remote user@docker-host -HostUploadsDir /srv/octop/data/uploads
 
 .EXAMPLE
-    .\install.ps1 -Agent Eous -WsUrl "ws://maim-bot-napcat:3001" -Token "dev-token"
+    .\install.ps1 -Remote user@docker-host -HostUploadsDir /srv/octop/data/uploads -Network napcat_net
 #>
 param(
-    [string]$Remote = "NEC8",
-    [string]$Agent = "Eous",
-    [string]$WsUrl = "ws://maim-bot-napcat:3001",
-    [string]$Token = "",
-    [string]$Name = "QQ (NapCat)",
-    [switch]$SkipUpload
+    [Parameter(Mandatory = $true)][string]$Remote,
+    [Parameter(Mandatory = $true)][string]$HostUploadsDir,
+    [string]$ContainerUploadsDir = "/data/.octop/uploads",
+    [string]$Container = "octop",
+    [string]$Network = "",
+    [switch]$SkipUpload,
+    [switch]$NoRestart
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$pluginDir = Join-Path $root "plugins\octop-onebot11"
-$toolsDir = Join-Path $root "plugins\octop-onebot11-tools"
-$remoteUploads = "/home/chen/Docker/Octop/data/uploads"
+$plugins = @("octop-onebot11", "octop-onebot11-tools")
+
+if ($HostUploadsDir -notmatch '^/[A-Za-z0-9_./-]+$') {
+    throw "-HostUploadsDir must be an absolute path without spaces or quotes"
+}
+if ($Container -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+    throw "-Container must be a plain container name"
+}
+if ($Network -and $Network -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') {
+    throw "-Network must be a plain network name"
+}
+if ($ContainerUploadsDir -notmatch '^/[A-Za-z0-9_./-]+$') {
+    throw "-ContainerUploadsDir must be an absolute path without spaces or quotes"
+}
 
 function Invoke-Remote([string]$Command) {
-    ssh $Remote "$Command"
+    ssh $Remote $Command
     if ($LASTEXITCODE -ne 0) { throw "remote command failed: $Command" }
 }
 
-Write-Host "[1/6] ensure remote upload directory" -ForegroundColor Cyan
-Invoke-Remote "mkdir -p $remoteUploads"
+$hostDir = $HostUploadsDir.TrimEnd('/')
+$containerDir = $ContainerUploadsDir.TrimEnd('/')
+
+Write-Host "[1/5] ensure remote upload directory" -ForegroundColor Cyan
+Invoke-Remote "mkdir -p '$hostDir'"
 
 if (-not $SkipUpload) {
-    Write-Host "[2/6] upload plugin" -ForegroundColor Cyan
-    scp -r $pluginDir "${Remote}:${remoteUploads}/"
-    if ($LASTEXITCODE -ne 0) { throw "scp channel plugin failed" }
-    scp -r $toolsDir "${Remote}:${remoteUploads}/"
-    if ($LASTEXITCODE -ne 0) { throw "scp tools plugin failed" }
+    Write-Host "[2/5] upload plugins" -ForegroundColor Cyan
+    foreach ($plugin in $plugins) {
+        # Drop the previous copy first so files removed from a plugin do not linger.
+        Invoke-Remote "rm -rf '$hostDir/$plugin'"
+        scp -r (Join-Path $root "plugins\$plugin") "${Remote}:${hostDir}/"
+        if ($LASTEXITCODE -ne 0) { throw "scp $plugin failed" }
+        Invoke-Remote "find '$hostDir/$plugin' -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; true"
+    }
 } else {
-    Write-Host "[2/6] upload skipped" -ForegroundColor Yellow
+    Write-Host "[2/5] upload skipped" -ForegroundColor Yellow
 }
 
-Write-Host "[3/6] install plugin" -ForegroundColor Cyan
-Invoke-Remote "docker exec octop octop plugin install /data/.octop/uploads/octop-onebot11 --force"
-Invoke-Remote "docker exec octop octop plugin install /data/.octop/uploads/octop-onebot11-tools --force"
+Write-Host "[3/5] install plugins inside the container" -ForegroundColor Cyan
+foreach ($plugin in $plugins) {
+    Invoke-Remote "docker exec $Container octop plugin install '$containerDir/$plugin' --force"
+}
 
-Write-Host "[4/6] attach Octop to maibot_maim_bot" -ForegroundColor Cyan
-ssh $Remote "docker network connect maibot_maim_bot octop 2>/dev/null; true"
+if ($Network) {
+    Write-Host "[4/5] attach $Container to Docker network $Network" -ForegroundColor Cyan
+    ssh $Remote "docker network connect $Network $Container 2>/dev/null; true"
+} else {
+    Write-Host "[4/5] no -Network given, skipping network attach" -ForegroundColor Yellow
+}
 
-Write-Host "[5/6] create channel" -ForegroundColor Cyan
-$config = @{ ws_url = $WsUrl; group_reply_mode = "mention" }
-if ($Token) { $config.token = $Token }
-$configJson = $config | ConvertTo-Json -Compress
-# ConvertTo-Json escapes nothing problematic here; single quotes keep it intact on the remote side.
-$remoteCmd = "docker exec octop octop channel create --agent $Agent --kind onebot11 --name '$Name' --config '$configJson'"
-ssh $Remote "$remoteCmd"
-
-Write-Host "[6/6] restart octop so the plugin and channel load in the server process" -ForegroundColor Cyan
-ssh $Remote "docker restart octop"
+if (-not $NoRestart) {
+    Write-Host "[5/5] restart the container so the plugins load" -ForegroundColor Cyan
+    Invoke-Remote "docker restart $Container"
+} else {
+    Write-Host "[5/5] restart skipped (-NoRestart)" -ForegroundColor Yellow
+}
 
 Write-Host ""
-Write-Host "Done. Check status with:" -ForegroundColor Green
-Write-Host "  ssh $Remote `"docker exec octop octop channel list --agent $Agent`""
-Write-Host "  ssh $Remote `"docker logs --tail 100 octop | grep -i onebot11`""
-Write-Host ""
-Write-Host "After NapCat logs in, create a WebSocket server on 0.0.0.0:3001 with the same token,"
-Write-Host "then update the channel if needed:"
-Write-Host "  ssh $Remote `"docker exec octop octop channel patch <channel_id> --config '{\"token\":\"$Token\"}'`""
+Write-Host "Done. Next steps:" -ForegroundColor Green
+Write-Host "  1. Dashboard -> Agent -> Channels -> add 'OneBot 11 (NapCat)' and fill in ws_url / token."
+Write-Host "     Reverse mode (NapCat dials Octop) needs a token unless it listens on 127.0.0.1 only."
+Write-Host "  2. Change an existing channel with scripts/patch_channel.py (read-merge-write; secrets via"
+Write-Host "     --set-env). Never call 'octop channel patch --config' directly: it REPLACES the whole config."
+Write-Host "  3. Check the startup log:"
+Write-Host "       ssh $Remote `"docker logs --tail 100 $Container | grep -i onebot11`""

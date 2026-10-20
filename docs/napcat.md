@@ -13,7 +13,7 @@ services:
     container_name: napcat
     restart: unless-stopped
     ports:
-      - "6099:6099"          # WebUI
+      - "127.0.0.1:6099:6099"   # WebUI 只绑本机；远程管理请走 SSH 隧道或带访问控制的反向代理
     volumes:
       - ./napcat/config:/app/napcat/config
       - ./napcat/qq:/app/.config/QQ
@@ -29,13 +29,15 @@ services:
 
 > 登录态保存在挂载出来的 QQ 配置目录中，重新创建容器不需要重复扫码。
 
+> **安全提示**：WebUI 能登录、改配置、读到账号上的聊天，不要把 6099 暴露到公网；OneBot 的 3001（正向）同理，只在容器网络 / 内网里开放，**不要写进 `ports:`**（同一 Docker 网络里的容器按名字访问即可）。两个端口一旦公网可达，任何人都可以冒用该 QQ 号收发消息。
+
 ## 2. 与 Octop 的网络关系
 
 | 部署方式 | 插件 `ws_url` / NapCat URL |
 |---|---|
 | 同一 Docker 网络 | `ws://napcat:3001`（正向）/ `ws://octop:3002/onebot/v11/ws`（反向） |
 | 同机不同网络 | 使用宿主机 IP + 映射端口 |
-| 跨主机 | 使用可达 IP，并确保端口放行 |
+| 跨主机 | 使用内网可达 IP，防火墙只放行 Octop 所在主机；必须配置 token，并优先考虑 VPN / 内网隧道 |
 
 容器名能否解析，取决于两者是否在同一个自定义网络里：
 
@@ -59,7 +61,7 @@ WebUI → 网络配置 → 新建 → **WebSocket 服务器**
 | 启用 | 是 |
 | Host | `0.0.0.0` |
 | Port | `3001` |
-| Token | 与 Octop 通道 `token` 一致 |
+| Token | 与 Octop 通道 `token` 一致（必填，使用强随机值） |
 | 消息格式 | `array` |
 | 上报自身消息 | 关闭 |
 | 心跳间隔 | `30000` |
@@ -147,6 +149,13 @@ Octop 侧配置：
 
 反向模式适合 NapCat 位于 NAT 后、或不想在 NapCat 侧开放入站端口的场景。NapCat 断开后会自动按 `reconnectInterval` 重连，Octop 侧监听器始终在线。
 
+**反向监听的安全规则**：
+
+- `listen_host` 不是回环地址（如默认的 `0.0.0.0`）时，通道**必须配置 `token`**，否则拒绝监听，状态栏显示“反向模式未配置 token，已拒绝监听 …”。原因：无 token 的开放端口会让任何能连到它的人顶掉真实 NapCat 的连接，并向 Octop 伪造聊天事件。
+- 只在本机使用时可以把 `listen_host` 设成 `127.0.0.1`，此时可以不配 token。
+- 网络完全可信、又确实不想配 token 时，才显式开启 `reverse_allow_no_token`（不推荐）。
+- 握手不合格的连接在升级为 WebSocket 之前就会被 HTTP 拒绝：路径不符 `404`、token 不符 `401`、多账号连接数达上限（32）`503`。
+
 ## 5. 消息格式必须用 array
 
 插件按 OneBot 11 的**数组格式**解析 `message`：
@@ -170,9 +179,10 @@ Octop 侧配置：
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | Octop 报 401 / 403 | 两端 token 不一致 | 重新对齐 token |
-| 反向连接被 1008 关闭 | 路径或 token 不匹配 | 检查 `listen_path` 与 token |
+| NapCat 反向连接被拒（HTTP 401 / 404 / 503） | token 不匹配 / 路径不符 / 多账号连接数已满 | 检查 token、`listen_path`（NapCat URL 的路径要与之相同）和连接数 |
+| Octop 状态栏“反向模式未配置 token，已拒绝监听” | 在非本机地址监听却没有 token | 配置 `token`；仅本机使用可改 `listen_host=127.0.0.1` |
 | 群消息只收到一部分 | `reportSelfMessage` 打开导致自回环 | 关闭上报自身消息 |
 | 发送成功但 QQ 没显示 | 账号被禁言 / 风控 / 不在群 | 检查账号状态与群权限 |
-| 图片发送失败 | 超过 10 MB 或 NapCat 未启用本地文件 | 压缩图片，或改用 URL |
+| 图片发送失败 | 超过 10 MB，或给的是服务器本地路径但没有授权目录 | 压缩图片；优先用 http(s) URL；本地文件需要管理员在通道里配置 `media_allowed_dirs` |
 
 > 个人 QQ 的自动化存在风控风险，避免高频群发、短时间大量加群/退群。插件内置的 20 条/60 秒限速只能约束单通道，不能替代账号侧的风控策略。

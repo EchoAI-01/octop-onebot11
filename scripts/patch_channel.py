@@ -21,24 +21,39 @@ This script closes both holes:
 Examples
 --------
     # Merge two keys on a remote host, then restart octop:
-    python3 scripts/patch_channel.py --host root@43.155.171.15 \
-        --cli /opt/octop/venv/bin/octop --agent VT9BCM --channel 01M5... \
+    python3 scripts/patch_channel.py --host user@octop-host \
+        --cli /opt/octop/venv/bin/octop --agent <AGENT_ID> --channel <CHANNEL_ID> \
         --set group_reply_mode=always --set trigger_keywords=日报,提醒 --restart
 
-    # Dry run: only show the merged config:
-    python3 scripts/patch_channel.py ... --set token=new-token --dry-run
+    # Secrets: keep them out of argv (visible in `ps` and shell history) by
+    # taking them from environment variables:
+    NEW_TOKEN=... python3 scripts/patch_channel.py ... --set-env token=NEW_TOKEN
+    OCTOP_API_TOKEN=... python3 scripts/patch_channel.py ... --api-url http://127.0.0.1:17792
+
+    # Dry run: only show the merged config (secret values are masked):
+    python3 scripts/patch_channel.py ... --set-env token=NEW_TOKEN --dry-run
 
     # Authoritative base file (keep it out of git, chmod 600):
     python3 scripts/patch_channel.py ... --base-file ~/onebot11.base.json --set ...
 
 Value parsing: each ``--set`` value is first parsed as JSON (so ``5`` becomes
-an int, ``true`` a bool), falling back to the raw string.
+an int, ``true`` a bool), falling back to the raw string.  ``--set-env``
+values are always taken verbatim as strings.
+
+Secret handling: the merged config is printed with token/secret/password
+values masked.  Over ``--host`` the config JSON is streamed to the remote shell
+on stdin instead of being embedded in the ssh command line.  The ``octop`` CLI
+itself only accepts ``--config`` as an argument, so it is briefly visible in
+that process's argv on the Octop host; ``--api-url`` (HTTP PATCH) avoids even
+that and is preferred.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -47,6 +62,7 @@ import urllib.request
 from typing import Any
 
 MASK_SUFFIX = "****"
+_SECRET_KEY_RE = re.compile(r"token|secret|password|passwd|api_?key", re.IGNORECASE)
 
 
 def _parse_value(raw: str) -> Any:
@@ -56,12 +72,21 @@ def _parse_value(raw: str) -> Any:
         return raw
 
 
-def _run(argv: list[str], *, check: bool = True) -> str:
+def _redacted(config: dict[str, Any]) -> dict[str, Any]:
+    """Copy of ``config`` that is safe to print (secret values masked)."""
+    return {
+        key: (MASK_SUFFIX if _SECRET_KEY_RE.search(str(key)) and value else value)
+        for key, value in config.items()
+    }
+
+
+def _run(argv: list[str], *, check: bool = True, stdin_text: str | None = None) -> str:
     result = subprocess.run(
         argv,
         capture_output=True,
         text=True,
         timeout=60,
+        input=stdin_text,
     )
     if check and result.returncode != 0:
         sys.stderr.write(result.stdout)
@@ -70,13 +95,21 @@ def _run(argv: list[str], *, check: bool = True) -> str:
     return result.stdout
 
 
-def _octop(args: argparse.Namespace, cli_args: list[str]) -> str:
+def _octop(args: argparse.Namespace, cli_args: list[str], *, config_json: str | None = None) -> str:
+    """Run the Octop CLI locally or over ssh.
+
+    ``config_json`` (the value for ``--config``) is passed to the remote shell
+    on stdin and expanded there, so it never appears in the ssh command line.
+    """
     if args.host:
         # ssh joins argv with spaces and re-parses on the remote shell, so
-        # every argument (JSON payloads especially) must be shell-quoted.
+        # every argument must be shell-quoted.
         remote = " ".join(shlex.quote(str(part)) for part in [args.cli, *cli_args])
-        return _run(["ssh", args.host, remote])
-    return _run([args.cli, *cli_args])
+        if config_json is not None:
+            remote = f'cfg="$(cat)" && {remote} --config "$cfg"'
+        return _run(["ssh", args.host, remote], stdin_text=config_json)
+    extra = ["--config", config_json] if config_json is not None else []
+    return _run([args.cli, *cli_args, *extra])
 
 
 def _looks_masked(value: Any) -> bool:
@@ -129,7 +162,8 @@ def main() -> int:
     parser.add_argument(
         "--api-token",
         default="",
-        help="dashboard JWT for --api-url (Authorization: Bearer)",
+        help="dashboard JWT for --api-url (Authorization: Bearer); prefer the "
+        "OCTOP_API_TOKEN environment variable — arguments are visible in `ps`",
     )
     parser.add_argument("--agent", required=True, help="agent id owning the channel")
     parser.add_argument("--channel", required=True, help="channel id to patch")
@@ -140,6 +174,15 @@ def main() -> int:
         default=[],
         metavar="KEY=VALUE",
         help="config override; repeatable; VALUE parsed as JSON then raw string",
+    )
+    parser.add_argument(
+        "--set-env",
+        dest="set_envs",
+        action="append",
+        default=[],
+        metavar="KEY=ENVVAR",
+        help="config override whose value is read from environment variable ENVVAR "
+        "(verbatim string); use for secrets such as token",
     )
     parser.add_argument(
         "--base-file",
@@ -168,6 +211,17 @@ def main() -> int:
         if not key:
             raise SystemExit(f"--set has an empty key: {item!r}")
         overrides[key] = _parse_value(raw_value)
+    for item in args.set_envs:
+        key, sep, env_name = item.partition("=")
+        key, env_name = key.strip(), env_name.strip()
+        if not sep or not key or not env_name:
+            raise SystemExit(f"--set-env expects KEY=ENVVAR, got: {item!r}")
+        if env_name not in os.environ:
+            raise SystemExit(f"--set-env {key}: environment variable {env_name} is not set")
+        overrides[key] = os.environ[env_name]
+
+    if not args.api_token:
+        args.api_token = os.environ.get("OCTOP_API_TOKEN", "")
 
     if args.base_file:
         with open(args.base_file, "r", encoding="utf-8") as handle:
@@ -189,7 +243,7 @@ def main() -> int:
         raise SystemExit(
             "refusing to patch: fields {missing} are masked by `channel get` and would be "
             "lost or corrupted by the replace-style patch. Provide them via --set "
-            "{missing}=VALUE (or pass --base-file with real values).".format(
+            "KEY=VALUE or --set-env KEY=ENVVAR (or pass --base-file with real values).".format(
                 missing=", ".join(missing)
             )
         )
@@ -199,8 +253,8 @@ def main() -> int:
         merged.pop(key, None)  # never write the mask back
     merged.update(overrides)
 
-    print("Merged config:")
-    print(json.dumps(merged, ensure_ascii=False, indent=2))
+    print("Merged config (secret values masked):")
+    print(json.dumps(_redacted(merged), ensure_ascii=False, indent=2))
     if args.dry_run:
         print("dry-run: nothing written")
         return 0
@@ -216,7 +270,8 @@ def main() -> int:
     print(f"Patching channel {args.channel} ...")
     output = _octop(
         args,
-        ["channel", "patch", args.channel, "--agent", args.agent, "--config", payload],
+        ["channel", "patch", args.channel, "--agent", args.agent],
+        config_json=payload,
     )
     print(output.strip() or "patched")
     print("NOTE: the running Gateway does not reload on its own — restart octop, call POST /api/plugins/reload, or use --api-url.")

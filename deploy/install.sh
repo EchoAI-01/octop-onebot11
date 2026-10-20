@@ -9,12 +9,16 @@
 # makes them take effect (hot reload when a token is given, restart otherwise)
 # and verifies the "applied ... plugin channel kind(s)" startup log line.
 #
-# Examples:
-#   ./deploy/install.sh --host root@43.155.171.15
-#   ./deploy/install.sh --host root@1.2.3.4 --mode docker --container octop
-#   ./deploy/install.sh --mode systemd                      # run on the Octop host itself
-#   ./deploy/install.sh --host root@1.2.3.4 --plugin tools  # only the tool plugin
-#   ./deploy/install.sh --host root@1.2.3.4 --reload-token "$OCTOP_ADMIN_TOKEN"
+# Examples (replace user@octop-host with your own SSH target):
+#   ./deploy/install.sh --host user@octop-host
+#   ./deploy/install.sh --host user@octop-host --mode docker --container octop
+#   ./deploy/install.sh --mode systemd                          # run on the Octop host itself
+#   ./deploy/install.sh --host user@octop-host --plugin tools   # only the tool plugin
+#   OCTOP_RELOAD_TOKEN=... ./deploy/install.sh --host user@octop-host   # hot reload, no restart
+#
+# The reload token can also be given as --reload-token; the environment
+# variable is preferred because command-line arguments are visible to every
+# local user in the process list.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,12 +28,13 @@ HOST=""              # empty = run locally on this machine
 CONTAINER="octop"    # docker container name
 UPLOADS_DIR=""       # systemd: plugin upload dir (default: <remote $HOME>/.octop/uploads)
 CLI_PATH=""          # systemd: octop binary (default: auto-detect)
-RELOAD_TOKEN=""      # admin token for POST /api/plugins/reload (optional)
+RELOAD_TOKEN="${OCTOP_RELOAD_TOKEN:-}"  # admin token for POST /api/plugins/reload (optional)
 API_URL=""           # e.g. http://127.0.0.1:17792 (default: auto-detect)
 PLUGIN="all"         # channel | tools | all
 
 usage() {
-  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print only the leading comment block of this file.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
   exit 0
 }
 
@@ -59,6 +64,11 @@ done
 
 [[ "$PLUGIN" =~ ^(channel|tools|all)$ ]] || die "--plugin must be channel|tools|all"
 [[ "$MODE" =~ ^(auto|docker|systemd)$ ]] || die "--mode must be auto|docker|systemd"
+[[ "$CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--container must be a plain container name"
+# These values are spliced into single-quoted remote shell strings.
+for _value in "$UPLOADS_DIR" "$CLI_PATH" "$API_URL"; do
+  [[ "$_value" != *"'"* ]] || die "single quotes are not allowed in --uploads-dir / --cli / --api-url"
+done
 
 PLUGINS=()
 if [[ "$PLUGIN" == "all" || "$PLUGIN" == "channel" ]]; then PLUGINS+=("octop-onebot11"); fi
@@ -124,8 +134,11 @@ upload_dir() { # upload_dir <name> — places plugins/<name> on the target, prin
     tmp="$(run 'mktemp -d')"
     if [[ -n "$HOST" ]]; then
       if ! rsync -a --delete --exclude '__pycache__' "$src/" "$HOST:$tmp/$name/" 2>/dev/null; then
-        run "mkdir -p '$tmp/$name'"
-        scp -r "$src" "$HOST:$tmp/$name/"
+        # No rsync on one side: copy the directory *contents* (copying "$src"
+        # itself would nest it as $tmp/$name/$name).
+        run "rm -rf '$tmp/$name' && mkdir -p '$tmp/$name'"
+        scp -r "$src/." "$HOST:$tmp/$name/"
+        run "find '$tmp/$name' -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true"
       fi
     else
       mkdir -p "$tmp/$name"
@@ -140,8 +153,8 @@ upload_dir() { # upload_dir <name> — places plugins/<name> on the target, prin
     run "mkdir -p '$dst/$name'"
     if [[ -n "$HOST" ]]; then
       if ! rsync -a --delete --exclude '__pycache__' "$src/" "$HOST:$dst/$name/" 2>/dev/null; then
-        run "mkdir -p '$dst/$name'"
-        scp -r "$src" "$HOST:$dst/"
+        run "rm -rf '$dst/$name' && mkdir -p '$dst/$name'"
+        scp -r "$src/." "$HOST:$dst/$name/"
       fi
       run "find '$dst/$name' -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true"
     else
@@ -167,12 +180,23 @@ reload_ok() {
   local url status
   url="$(detect_api_url)"
   [[ -n "$url" ]] || return 1
-  status="$(run "curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer $RELOAD_TOKEN' '$url/api/plugins/reload'")" || return 1
+  # The token travels on stdin (curl -H @-), never inside a command line, so it
+  # does not appear in `ps` here or on the target and cannot break the quoting.
+  status="$(printf 'Authorization: Bearer %s\n' "$RELOAD_TOKEN" \
+    | run "curl -s -o /dev/null -w '%{http_code}' -X POST -H @- '$url/api/plugins/reload'")" || return 1
   [[ "$status" == "200" ]]
 }
 
 echo "[4/5] applying plugins"
-LOG_MARKER=0 # octop.log line count before the restart; verify only lines after it
+# Remember where the log stands *before* applying anything (reload or restart),
+# so verification can only match lines written by this very deployment.
+LOG_MARKER=0
+SINCE=""
+if [[ "$DEPLOY_MODE" == "docker" ]]; then
+  SINCE="$(run 'date -u +%Y-%m-%dT%H:%M:%SZ')"
+else
+  LOG_MARKER="$(run 'wc -l < "$HOME/.octop/logs/octop.log" 2>/dev/null || echo 0')"
+fi
 if reload_ok; then
   echo "      hot reload succeeded (no restart needed)"
   sleep 2
@@ -181,7 +205,6 @@ else
   if [[ "$DEPLOY_MODE" == "docker" ]]; then
     run "docker restart '$CONTAINER'"
   else
-    LOG_MARKER="$(run 'wc -l < "$HOME/.octop/logs/octop.log" 2>/dev/null || echo 0')"
     if ! run 'systemctl restart octop'; then
       # systemd start-rate limit (StartLimitBurst) after frequent restarts.
       echo "      restart hit the systemd start limit; retrying after reset-failed"
@@ -196,15 +219,18 @@ fi
 # --------------------------------------------------------------------------
 
 echo "[5/5] verifying"
+boot_log=""
 if [[ "$DEPLOY_MODE" == "docker" ]]; then
-  run "docker ps --format '{{.Names}} {{.Status}}' | grep -q '^$CONTAINER ' || die 'container not running'"
-  sleep 4
-  boot_log="$(run "docker logs --since 2m '$CONTAINER' 2>&1")"
+  run "docker ps --format '{{.Names}} {{.Status}}' | grep -q '^$CONTAINER ' || exit 1" || die "container not running"
+  for _ in $(seq 1 15); do
+    boot_log="$(run "docker logs --since '$SINCE' '$CONTAINER' 2>&1 | grep 'applied [0-9]* plugin channel kind' | tail -1" || true)"
+    [[ -n "$boot_log" ]] && break
+    sleep 2
+  done
 else
   run 'systemctl is-active --quiet octop.service' || die "octop.service is not active"
-  boot_log=""
   for _ in $(seq 1 15); do
-    boot_log="$(run "tail -n +$((LOG_MARKER + 1)) \"\$HOME/.octop/logs/octop.log\" 2>/dev/null | grep 'applied [0-9]* plugin channel kind' | tail -1")"
+    boot_log="$(run "tail -n +$((LOG_MARKER + 1)) \"\$HOME/.octop/logs/octop.log\" 2>/dev/null | grep 'applied [0-9]* plugin channel kind' | tail -1" || true)"
     [[ -n "$boot_log" ]] && break
     sleep 2
   done

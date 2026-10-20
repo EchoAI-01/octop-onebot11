@@ -9,10 +9,12 @@ testable on a workstation without Octop or a running NapCat.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,12 @@ import types
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# Every temp file the checks create lives under one directory that is removed
+# on exit, so a run leaves nothing behind (also on shared hosts).
+_SCRATCH = tempfile.mkdtemp(prefix="ob11-offline-")
+tempfile.tempdir = _SCRATCH
+atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
 # Stub octop_gateway
@@ -382,6 +390,12 @@ def main() -> None:
 
     channel._connected_transport = True
     channel._login_confirmed = True
+    # Earlier checks left other channel instances in the process-wide registry;
+    # auto-selection is only allowed when exactly one channel is live (the
+    # multi-channel refusal is covered in test_plugin_regression.py).
+    for stale_id in [cid for cid, other in plugin._LIVE_CHANNELS.items() if other is not channel]:
+        plugin._LIVE_CHANNELS.pop(stale_id)
+    assert plugin.list_live_channels() == [channel]
     pushed = {}
 
     async def fake_push_segments(subject, segments):
@@ -699,17 +713,68 @@ def main() -> None:
     media_only = ch_v3._compose_push_chunks([{"type": "image", "data": {"file": "https://x/b.png"}}])
     assert len(media_only) == 1 and media_only[0][0]["type"] == "image"
 
-    # Local media paths are inlined as base64; URLs and unknown paths pass through.
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-        handle.write(b"pngbytes")
-        local_path = handle.name
-    materialized = ch_v3._materialize_media_segment({"type": "image", "data": {"file": local_path}})
+    # Local media paths: rejected by default; inlined as base64 only below
+    # media_allowed_dirs.  URLs and base64 payloads pass through untouched.
+    media_dir = tempfile.mkdtemp()
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"pngbytes"
+    local_path = os.path.join(media_dir, "shot.png")
+    with open(local_path, "wb") as handle:
+        handle.write(png_bytes)
+    local_seg = {"type": "image", "data": {"file": local_path}}
+    try:
+        ch_v3._materialize_media_segment(local_seg)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("local files must be rejected unless media_allowed_dirs is set")
+
+    cfg_media = plugin.OneBot11Config.from_dict(
+        {"ws_url": "ws://127.0.0.1:3001", "media_allowed_dirs": media_dir}
+    )
+    ch_media = plugin.OneBot11Channel(lambda _m: None, config=cfg_media, channel_id="ch-media", tenant_id="a")
+    materialized = ch_media._materialize_media_segment(local_seg)
     assert materialized["data"]["file"].startswith("base64://")
-    assert base64.b64decode(materialized["data"]["file"][len("base64://"):]) == b"pngbytes"
+    assert base64.b64decode(materialized["data"]["file"][len("base64://"):]) == png_bytes
+    via_file_url = ch_media._materialize_media_segment(
+        {"type": "image", "data": {"file": "file://" + local_path}}
+    )
+    assert via_file_url["data"]["file"] == materialized["data"]["file"]
+
+    def _must_raise(exc_type, segment, why):
+        try:
+            ch_media._materialize_media_segment(segment)
+        except exc_type:
+            return
+        raise AssertionError(why)
+
+    secret_path = os.path.join(tempfile.mkdtemp(), "secret.png")
+    with open(secret_path, "wb") as handle:
+        handle.write(png_bytes)
+    _must_raise(PermissionError, {"type": "image", "data": {"file": secret_path}}, "outside allowed dirs")
+    link_path = os.path.join(media_dir, "escape.png")
+    os.symlink(secret_path, link_path)
+    _must_raise(PermissionError, {"type": "image", "data": {"file": link_path}}, "symlink must not escape")
+    traversal = os.path.join(media_dir, "..", os.path.basename(os.path.dirname(secret_path)), "secret.png")
+    _must_raise(PermissionError, {"type": "image", "data": {"file": traversal}}, "../ traversal")
+    notes_path = os.path.join(media_dir, "notes.txt")
+    with open(notes_path, "wb") as handle:
+        handle.write(b"not an image")
+    _must_raise(ValueError, {"type": "image", "data": {"file": notes_path}}, "non-image bytes as image")
+    assert ch_media._materialize_media_segment({"type": "file", "data": {"file": notes_path}})["data"][
+        "file"
+    ].startswith("base64://"), "non-image segment types skip the image magic check"
+    _must_raise(ValueError, {"type": "image", "data": {"file": "relative/shot.png"}}, "relative path")
+    _must_raise(ValueError, {"type": "image", "data": {"file": "ftp://host/a.png"}}, "unknown scheme")
+    _must_raise(PermissionError, {"type": "image", "data": {"file": "file://evil-host/x.png"}}, "remote file://")
+    _must_raise(
+        ValueError,
+        {"type": "image", "data": {"file": os.path.join(media_dir, "missing.png")}},
+        "missing file",
+    )
     url_seg = {"type": "image", "data": {"file": "https://example.com/a.png"}}
     assert ch_v3._materialize_media_segment(url_seg) is url_seg
-    missing_seg = {"type": "image", "data": {"file": "/no/such/file.png"}}
-    assert ch_v3._materialize_media_segment(missing_seg) is missing_seg
+    b64_seg = {"type": "image", "data": {"file": "base64://AAAA"}}
+    assert ch_v3._materialize_media_segment(b64_seg) is b64_seg
     text_seg = {"type": "text", "data": {"text": "keep"}}
     assert ch_v3._materialize_media_segment(text_seg) is text_seg
 

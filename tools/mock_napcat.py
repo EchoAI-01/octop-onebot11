@@ -12,6 +12,10 @@ actions.  Use ``--logged-in`` to simulate a logged-in NapCat; omit it to
 verify that Octop creates and keeps the channel while QQ is not logged in.
 ``--http-port`` exposes the same actions over the OneBot 11 HTTP API
 (``POST /<action>``) so the channel's HTTP fallback path can be exercised.
+``--ack-delay`` / ``--no-ack-send`` simulate a slow or silent NapCat: the
+``send_*`` actions are still executed (and logged, i.e. the message counts as
+delivered) but their responses arrive late or never, which is exactly the
+"delivered but not acknowledged" situation the outbox has to survive.
 """
 
 from __future__ import annotations
@@ -113,6 +117,14 @@ async def _send_test_event(ws: Any) -> None:
     _log("sent test group message (message_id=9001, group_id=20002)")
 
 
+async def _send_later(ws: Any, delay: float, frame: str) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await ws.send(frame)
+    except websockets.ConnectionClosed:
+        pass
+
+
 async def handler(ws: Any, args: argparse.Namespace) -> None:
     if args.token:
         auth = ws.request.headers.get("Authorization", "")
@@ -137,7 +149,14 @@ async def handler(ws: Any, args: argparse.Namespace) -> None:
             ok, data, retcode, wording = _action_result(action, params, logged_in=args.logged_in)
             if retcode == 1400:
                 _log(f"unsupported action={action} params={params}")
-            await ws.send(_response(echo, ok=ok, data=data, retcode=retcode, wording=wording))
+            frame = _response(echo, ok=ok, data=data, retcode=retcode, wording=wording)
+            is_send = str(action).startswith("send_")
+            if is_send and args.no_ack_send:
+                continue  # executed and logged above, but never acknowledged
+            if is_send and args.ack_delay > 0:
+                asyncio.create_task(_send_later(ws, args.ack_delay, frame))
+                continue
+            await ws.send(frame)
     except websockets.ConnectionClosed:
         _log("client disconnected")
     finally:
@@ -202,6 +221,17 @@ async def main() -> None:
     parser.add_argument("--logged-in", action="store_true")
     parser.add_argument("--send-test-after", type=int, default=0)
     parser.add_argument("--log-file", default="")
+    parser.add_argument(
+        "--ack-delay",
+        type=float,
+        default=0.0,
+        help="seconds to wait before answering send_* actions (the message is still delivered)",
+    )
+    parser.add_argument(
+        "--no-ack-send",
+        action="store_true",
+        help="execute send_* actions but never answer them",
+    )
     args = parser.parse_args()
     if args.log_file:
         _out_log = open(args.log_file, "a", encoding="utf-8")  # noqa: SIM115

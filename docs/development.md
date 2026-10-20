@@ -9,11 +9,11 @@
 |---|---|
 | 定位 | Octop 的 OneBot 11 / NapCat 通道插件，让 Octop 接入个人 QQ |
 | 组成 | 1 个 channel 插件 + 1 个 tool 插件 + 测试/部署/运维脚本 |
-| 代码量 | 插件约 2.7k 行（通道 2.5k + 工具 0.3k），测试约 2.0k 行，运维脚本约 0.4k 行 |
+| 代码量 | 插件约 3.6k 行（通道 3.2k + 工具 0.4k），测试与测试夹具约 4.2k 行，运维/部署脚本约 1.1k 行 |
 | 运行环境 | Octop 进程内，由插件加载器动态导入 |
 | 外部依赖 | 仅 `websockets`（Octop 已内置，验证 15.0.1）；HTTP 回退用标准库 `urllib` |
 | 支持版本 | websockets 13–17，Python 3.12+ |
-| 当前版本 | v0.5.0 |
+| 当前版本 | v0.6.0 |
 
 ### 仓库结构
 
@@ -25,16 +25,20 @@ octop-onebot11/
 │  │  └─ main.py                 # 配置类 + 通道实现 + 字段 schema
 │  └─ octop-onebot11-tools/      # tool 插件，入口 setup(ctx)
 │     ├─ plugin.yaml             # id / kind: tool
-│     └─ main.py                 # onebot11_send_group / _private
+│     └─ main.py                 # onebot11_send_group / _private / _forward_group
 ├─ tools/
-│  ├─ mock_napcat.py             # 假 NapCat：WS 服务端 + action 响应
+│  ├─ mock_napcat.py             # 假 NapCat：WS/HTTP 服务端 + action 响应（可模拟慢/无应答）
+│  ├─ octop_stubs.py             # octop_gateway 契约的共享替身（离线测试与回归测试用）
 │  ├─ test_plugin_offline.py     # 纯逻辑测试，不需要 Octop
-│  └─ test_plugin_e2e.py         # 真实 WS 测试，含反向/outbox 场景
+│  ├─ test_plugin_regression.py  # 每个审计发现一条回归用例（进程内假 NapCat + 真 websockets）
+│  ├─ test_plugin_e2e.py         # 真实 WS + mock NapCat 子进程，含反向/outbox/慢应答场景
+│  └─ test_plugin_core_integration.py  # 真实 octop_gateway/octop_harness 契约测试（未安装则跳过）
 ├─ scripts/
-│  └─ patch_channel.py           # 配置读-合并-写（防 channel patch 整体替换）
+│  ├─ patch_channel.py           # 配置读-合并-写（防 channel patch 整体替换，密钥走环境变量）
+│  └─ patch_dashboard.py         # Dashboard bundle 补丁：select / help / 简介渲染
 ├─ deploy/
 │  ├─ install.sh                 # 跨形态部署脚本（systemd / docker，R2）
-│  ├─ install.ps1                # Windows legacy（特定环境）
+│  ├─ install.ps1                # Windows 辅助脚本（参数化，仅 Docker 形态；不创建通道）
 │  └─ onebot11_config.template.json
 ├─ docs/                         # 本文件、design.md、napcat.md
 └─ .github/workflows/ci.yml
@@ -66,11 +70,24 @@ python -m venv .venv
 .venv/Scripts/python -m pip install "websockets==15.0.1"   # Windows
 # source .venv/bin/activate && pip install "websockets==15.0.1"   # Linux/macOS
 
-python tools/test_plugin_offline.py     # 不需要 Octop，秒级
-python tools/test_plugin_e2e.py         # 起 mock NapCat，约 5 秒
+python tools/test_plugin_offline.py       # 不需要 Octop，秒级
+python tools/test_plugin_regression.py    # 审计回归，进程内假 NapCat，约 20 秒
+python tools/test_plugin_e2e.py           # 起 mock NapCat 子进程，约 25 秒
+python tools/test_plugin_core_integration.py   # 需要真实 Octop 包，否则自动跳过
 ```
 
-`test_plugin_offline.py` 用轻量 stub 替换 `octop_gateway`，所以**不需要安装 Octop** 就能验证解析、路由、配置和鉴权逻辑。改动协议层时优先补这里的断言。
+离线与回归测试用 `tools/octop_stubs.py` 里的替身代替 `octop_gateway`，所以**不需要安装 Octop** 就能验证解析、路由、配置、鉴权和重试逻辑。改动协议层时优先补这里的断言。
+
+想在真实 Octop 组件上跑契约测试（推荐在改动配置、群上下文、限速、工具参数时跑一遍）：
+
+```bash
+pip install "octop-gateway==1.0.3" "octop-harness==1.0.4"
+ONEBOT11_REQUIRE_CORE=1 python tools/test_plugin_core_integration.py   # 装不上就报错而不是跳过
+```
+
+它在同一进程里用真实插件加载器加载两个插件，用真实 `ChannelManager` 驱动通道，对着进程内假 NapCat 收发；只占用 OS 分配的回环端口，不触碰任何现网服务。
+
+**验证“测试真的能抓到回归”**：`ONEBOT11_PLUGIN_MAIN=/path/to/old/main.py python tools/test_plugin_regression.py` 会让测试加载另一份通道插件（例如 `git show <旧提交>:plugins/octop-onebot11/main.py > /tmp/old_main.py`）。新增回归用例时，先在旧实现上确认它会失败，再在新实现上确认它通过。
 
 ### 在真实 Octop 上调试
 
@@ -98,12 +115,13 @@ docker logs -f octop | grep -i onebot11
 ### 提交前检查
 
 ```bash
-python -m py_compile plugins/octop-onebot11/main.py plugins/octop-onebot11-tools/main.py tools/mock_napcat.py
+python -m compileall -q plugins scripts tools
 python tools/test_plugin_offline.py
+python tools/test_plugin_regression.py
 python tools/test_plugin_e2e.py
 ```
 
-CI 会跑 Python 3.12 / 3.13 两个版本，本地至少保证 3.12 通过。
+CI 的 `test` 任务在 Python 3.12 / 3.13 上跑以上全部，`core-integration` 任务在 3.12 上装真实 Octop 包跑契约测试；本地至少保证 3.12 通过。
 
 ## 3. 代码地图
 
@@ -112,25 +130,26 @@ CI 会跑 Python 3.12 / 3.13 两个版本，本地至少保证 3.12 通过。
 | 区块 | 关键成员 | 说明 |
 |---|---|---|
 | 工具函数 | `_to_bool` / `_to_int` / `_to_float` / `_split_id_list` / `_normalize_path` | Dashboard 表单值是字符串，统一归一化 |
-| 模块级 | `_LIVE_CHANNELS` / `get_live_channel()` / `build_group_subject()` / `build_private_subject()` | 供 tool 插件取活实例、构造主动发送目标 |
+| 模块级 | `_LIVE_CHANNELS` / `get_live_channel()` / `list_live_channels()` / `build_group_subject()` / `build_private_subject()` | 供 tool 插件取活实例、构造主动发送目标；注册表按实例身份注销，旧实例停止不会踢掉新实例 |
 | 配置 | `OneBot11Config` | `ChannelConfig` 子类，`from_dict` 由 Octop 调用；`missing_credentials()` 按模式校验 |
 | 生命周期 | `start()` / `stop()` / `is_connected` / `runtime_error` | `start()` 永不因连接失败抛错；`start()` 同时拉起 outbox flush 协程 |
-| 连接会话 | `_ConnSession` / `_add_session()` / `_remove_session()` / `_primary_session()` / `_select_session()` / `_register_session_identity()` / `_refresh_state()` | 每条连接独立 self_id/登录态/探针/pending；聚合计从会话表派生；多账号共存、同账号重连顶旧 |
+| 连接会话 | `_ConnSession` / `_add_session()` / `_remove_session()` / `_primary_session()` / `_select_session()` / `_register_session_identity()` / `_refresh_state()` / `_fail_pending()` | 每条连接独立 self_id/登录态/探针/pending/事件队列；聚合计从会话表派生；多账号共存、同账号重连顶旧；会话上限 32 |
+| 收包 | `_run_session()` / `_read_frames()` / `_ingest_payload()` / `_dispatch_fast()` / `_session_worker()` / `_drain_session_events()` / `_dispatch_payload()` | 读循环只收帧：echo 与 meta 就地处理，其余事件入该会话的有序队列；worker 逐条处理；连接关闭后先失败 pending 再限时排空 |
 | 正向 | `_run_forever()` / `_connect_once()` / `_receiver(session)` | 拨号、退避重连、收帧（同样走会话） |
-| 反向 | `_serve_forever()` / `_handle_reverse_client()` | 监听、鉴权、会话挂载/摘除（`multi_account` 控制共存或替换） |
+| 反向 | `_serve_forever()` / `_reverse_listen_refusal()` / `_server_factory()` / `_reverse_process_request()` / `_reverse_rejection()` / `_handle_reverse_client()` | 安全默认（非回环无 token 不监听）、握手前拒绝（404/401/503）、会话挂载/摘除（`multi_account` 控制共存或替换） |
 | 登录态 | `_login_probe_loop()` / `_handle_meta_event()` | `get_login_info` + heartbeat 双来源 |
 | 入站 | `parse_inbound()` / `_parse_message_content()` / `_parse_cq_string()` | OneBot 事件 → `InboundMessage` |
 | 触发 | `_parse_keywords()` / `_keyword_hit()` / `_handle_message_event()` | @ / 关键词 / 私聊策略过滤 |
 | 出站 | `_send_text()` / `_send_content()` / `_send_media()` / `_send_segments()` / `_build_send_action()` | 文本分片、base64 媒体、群/私聊路由；被动路径过白名单门控 |
-| 主动发送 | `push_text()` / `push_segments()` / `_compose_push_chunks()` / `_materialize_media_segment()` | strict 语义；at/图片/文本混排；本地图片转 base64 |
+| 主动发送 | `push_text()` / `push_segments()` / `_compose_push_chunks()` / `_materialize_media_segment()` / `_read_allowed_local_file()` | strict 语义；at/图片/文本混排；本地文件仅限 `media_allowed_dirs`，转 base64 |
 | 出站策略 | `_send_denial()` / `_default_constraints()` | `allowed_groups` / `allowed_users` 白名单；限速读配置 |
-| 入站策略 | `_handle_message_event()` 中的 `blocked_senders` / `allowed_senders` 检查 | 发送人黑名单优先于白名单 |
+| 入站策略 | `_sender_allowed()`（消息、戳一戳、自动通过共用） | 发送人黑名单优先于白名单 |
 | 事件处理 | `_handle_notice_event()` / `_handle_request_event()` / `_enqueue_poke()` | 好友/群邀请自动通过、戳一戳合成触发、撤回/入群日志 |
 | HTTP 回退 | `_http_available()` / `_call_api_http()` | `_call_api()` 在 WS 不可用时改走 `POST {http_api_url}/{action}`（标准库 urllib + to_thread） |
 | 群巡检 | `_ensure_monitor_task()` / `_monitor_loop()` / `_monitor_record()` / `_monitor_sweep()` / `_monitor_keyword_hit()` / `_synthetic_message()` | 非触发消息入缓冲；周期检查；间隔/每小时双重节流；摘要触发 Agent；`_MONITOR_SKIP_TEXTS` 哨兵在 `_send_text()` 静默丢弃 |
 | 待发队列 | `_OutboxItem` / `_enqueue_outbox()` / `_flush_outbox()` / `_outbox_flush_loop()` / `_outbox_backoff()` | 断线排队、按序补发、指数退避、TTL/次数上限；WS 断开且 HTTP 可用时也会补发；条目携带 account |
 | 队列持久化 | `_persist_path()` / `_persist_outbox()` / `_load_outbox()` | enqueue/flush/stop 原子落盘；构造时恢复（epoch↔monotonic 换算保 TTL） |
-| 协议 | `_call_api()` / `_dispatch_payload()` / `_fail_pending()` | `echo` 关联、超时、断线失败 |
+| 协议 | `_call_api()` / `_call_via()` / `_api_via_session()` | `echo` 关联、超时、断线失败；`_call_via(session)` 保证在收到事件的那条连接上追问 |
 | 字段 schema | `_FIELDS` / `setup()` | Dashboard 表单声明 |
 
 ### `plugins/octop-onebot11-tools/main.py`
@@ -138,7 +157,8 @@ CI 会跑 Python 3.12 / 3.13 两个版本，本地至少保证 3.12 通过。
 | 成员 | 说明 |
 |---|---|
 | `_channel_module()` | 从 `sys.modules` 取 channel 插件模块 |
-| `_resolve_channel()` | 取活实例（不要求 `is_connected`：断线时走 HTTP 回退或 outbox 排队） |
+| `_CONFIG_FIELDS` / `_bound_channel_id()` | 每个工具声明 `channel_id` 配置项；经 `octop_harness.plugins.tools.get_tool_config()` 读取该 Agent 的绑定 |
+| `_resolve_channel()` | 绑定优先；未绑定时仅在恰有一个通道时自动选用，多通道拒绝；不要求 `is_connected`（断线时走 HTTP 回退或 outbox 排队） |
 | `onebot11_send_group()` / `onebot11_send_private()` | 构造 subject → `push_segments()`，支持 `image_url` / `at_user_id` / `reply_to_message_id` / `account`（多账号路由），失败返回 `发送失败: ...` |
 | `onebot11_send_forward_group()` | `messages_json` → OneBot node 数组 → `push_forward()`（合并转发，仅群） |
 | `_push_note()` | 断线排队提示；HTTP 回退成功时不提示 |
@@ -153,6 +173,8 @@ CI 会跑 Python 3.12 / 3.13 两个版本，本地至少保证 3.12 通过。
 | `--logged-in` | `get_login_info` 返回有效 `user_id` |
 | `--send-test-after N` | 启动 N 秒后推一条群 @ 测试消息 |
 | `--log-file` | 把收到的 action 写入文件，E2E 用它断言 |
+| `--http-port` | 同时开 OneBot HTTP API，用来测 HTTP 回退 |
+| `--ack-delay S` / `--no-ack-send` | `send_*` 照常执行并记日志，但应答延迟 S 秒 / 永不应答（模拟“已送达但没确认”） |
 
 ## 4. 核心机制
 
@@ -174,7 +196,7 @@ CI 会跑 Python 3.12 / 3.13 两个版本，本地至少保证 3.12 通过。
 - 结构化 `at` 段且 `qq == self_id`；
 - 文本命中 `trigger_keywords`（子串、默认不区分大小写）。
 
-`_handle_message_event()` 再按 `group_reply_mode` / `private_reply_mode` 过滤。**未触发的群消息不会入队**，只进 `GroupContextManager` 缓存。
+`_handle_message_event()` 再按 `group_reply_mode` / `private_reply_mode` 过滤并入队。**未触发的群消息不会触发 Agent**：它们照常进入核心队列，由核心的 `GroupContextManager.prepare()` 判定为被动聊天，只进短期缓存（缓存里的发送者来自 `metadata["sender_id"]`）。
 
 ### 4.3 出站路由
 
@@ -200,8 +222,9 @@ _FIELDS（表单 schema） → Dashboard 表单 → channels.config_json
 ```
 
 - 表单只覆盖 `_FIELDS`；高级字段只能通过 CLI/JSON 写入。
-- `from_dict` 支持 `field_aliases`（`access_token` → `token`）。
-- 反向模式通过 `missing_credentials()` 跳过 `ws_url` 必填校验。
+- `from_dict` 支持 `field_aliases`（`access_token` → `token`），并会去掉字符串首尾空白。
+- `__post_init__` 统一转换：Dashboard 给的数字/布尔常常是字符串，空值与非法值回退默认并写一条警告，永远不让配置构造失败。
+- 反向模式通过 `missing_credentials()` 跳过 `ws_url` 必填校验。**不要**把“反向需要 token”放进 `missing_credentials()`：核心会据此抛 `ChannelCredentialsError`，整条通道创建失败，状态栏也看不到原因；这条规则在启动监听时判定并写入 `runtime_error`。
 
 ## 5. 开发约定
 
@@ -211,7 +234,10 @@ _FIELDS（表单 schema） → Dashboard 表单 → channels.config_json
 4. **新增配置项三步**：dataclass 字段 → `_FIELDS` 条目 → 离线测试断言。缺一不可。
 5. **新增行为必须带测试**。协议/传输相关加 E2E，纯逻辑加离线断言。
 6. **兼容旧版本**。改 `websockets` 调用时保留 13–17 的兼容分支。
-7. **不打印 token**。日志里只允许出现是否配置，不允许出现值。
+7. **不打印 token**。日志里只允许出现是否配置，不允许出现值；URL 先过 `_redact_url()`。
+8. **不可信输入不直接生效**：群消息文本/昵称、模型传入的路径与 ID，必须先校验或中和，再进入提示词、文件系统或 OneBot 动作。
+9. **收包循环不 await 业务**：读循环里只做解码、应答投递和入队；任何要等 API 应答的逻辑都放进事件 worker。
+10. **仓库里不放现网标识**：服务器 IP、Agent ID、通道 ID、token 一律用占位符；示例用 `user@octop-host`、`<AGENT_ID>`。
 
 ## 6. 常见开发任务
 
@@ -260,6 +286,10 @@ self.max_image_bytes = _to_int(self.max_image_bytes, 10 * 1024 * 1024)
 | NapCat `string` 格式 | 消息变成 CQ 码 | 配置 `array`；插件仅保留 CQ 回退 |
 | websockets 版本差异 | `additional_headers` / `serve` 参数不同 | 保留 `TypeError` 回退分支 |
 | 改插件 id | tool 插件找不到 channel 模块 | 同步改 `_CHANNEL_MODULE` |
+| 读循环里等 API 应答 | 应答只能由读循环收，等到超时 | 事件一律交给会话 worker（见 design.md 4.1） |
+| `always` 没生效 | 核心要求 `visibility=all` 才兑现 `activation=always` | `group_reply_mode=always` 时同时写 `visibility="all"` |
+| 群历史里发送者全是 `unknown` | 核心用 `metadata["sender_id"]` 记发送者 | `parse_inbound()` 必须写 `sender_id` / `sender_name` |
+| 工具串到别的通道 | 多通道时按“第一个”选通道 | 用每个 Agent 的 `channel_id` 工具配置绑定；未绑定多通道直接拒绝 |
 
 ## 8. 路线图
 
@@ -279,6 +309,7 @@ self.max_image_bytes = _to_int(self.max_image_bytes, 10 * 1024 * 1024)
 | P1 | ~~主动发送引用 / 合并转发 / 结构化 at~~ **v0.4.0 已完成** | `reply_to_message_id`、`onebot11_send_forward_group`、`metadata.mentions`、`resolve_forward` | — | — |
 | P1 | ~~多账号（反向多连接路由）~~ **v0.5.0 已完成** | 一个通道接多个 QQ | — | — |
 | P2 | ~~outbox 持久化~~ **v0.5.0 已完成（文件级，`~/.octop/onebot11/state`）** | Octop 重启后排队消息不丢 | — | — |
+| P1 | ~~审计修复~~ **v0.6.0 已完成（第 13 节）** | 收包死锁、反向监听默认开放、本地文件读取、重试放大、提示注入等 | — | — |
 | P2 | 指标与健康检查 | 可观测性 | 1–2 人日 | — |
 | P2 | 配置向导 / 表单联动 | 降低配置门槛 | 2–3 人日 | Dashboard 支持 |
 
@@ -337,7 +368,7 @@ GET /api/v1/agents/{agent_id}/channels/{channel_id}/config
 
 ```json
 {
-  "channel_id": "01M5...",
+  "channel_id": "<CHANNEL_ID>",
   "kind": "onebot11",
   "version": "sha256:9f2c...",
   "config": {
@@ -394,7 +425,7 @@ Content-Type: application/json
 
 ```json
 {
-  "channel_id": "01M5...",
+  "channel_id": "<CHANNEL_ID>",
   "applied": true,
   "restarted": false,
   "changed": ["group_reply_mode", "trigger_keywords"],
@@ -513,12 +544,12 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 
 ### 10.2 方案
 
-新增 `deploy/install.sh`（bash，macOS/Linux 通用，替代 install.ps1 成为默认部署入口；install.ps1 保留但标记为 legacy）：
+新增 `deploy/install.sh`（bash，macOS/Linux 通用，替代 install.ps1 成为默认部署入口；install.ps1 保留为 Windows 辅助脚本，只做上传/安装/重启，不创建通道）：
 
 - `--mode auto|docker|systemd`：auto 探测——systemd 服务 `octop.service` 存在且 active → systemd；存在名为 octop 的容器 → docker；两者都有或都没有则报错，要求显式指定。
 - `--host user@server`：远程模式，内部走 scp/ssh；缺省在本地执行。
 - `--container <name>` / `--uploads-dir <path>` / `--cli <path>`：覆盖各自的默认值。
-- `--reload-token <token>`：优先对 API 端口 `POST /api/plugins/reload`，成功则跳过重启；失败（401/超时）降级为重启并提示。
+- `--reload-token <token>`（或环境变量 `OCTOP_RELOAD_TOKEN`，更推荐：命令行参数在进程列表里可见）：优先对 API 端口 `POST /api/plugins/reload`，成功则跳过重启；失败（401/超时）降级为重启并提示。
 - 流程：上传插件目录（排除 `__pycache__`）→ `plugin install --force`（channel + tools 两个插件）→ reload/重启 → grep 日志 `applied N plugin channel kind(s)` 验证 → 汇总输出。
 - `--sync-only`：开发迭代快捷模式，只处理指定插件目录，本机改完一条命令到服务器生效。
 
@@ -563,14 +594,48 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 - **探测循环修复**：`session.login_confirmed` 置位后必须 `_refresh_state()`，否则聚合计不更新（E2E 抓出过一次，勿回退）。
 - **持久化是文件级而非事务级**：进程崩溃可能丢最后一批未落盘消息；去重缓存不持久化（真实 NapCat 断线不重推，mock 重推属测试夹具行为）。
 
-## 13. 发布与交接
+## 13. v0.6.0 审计修复（R5）
+
+对 v0.5.1 做了一次完整代码审计（含对部署环境的受控动态验证），发现的问题全部修复，并且每一条都有一个会在旧实现上失败的用例。下表的“用例”在 `tools/test_plugin_regression.py`（`core:` 前缀的在 `tools/test_plugin_core_integration.py`，`e2e:` 前缀的在 `tools/test_plugin_e2e.py`）。
+
+| 方面 | 问题 | 修复 | 用例 |
+|---|---|---|---|
+| 收包 | 读循环在处理事件时等待 API 应答（如展开合并转发），而应答只能由它自己收 → 死锁到超时 | 读循环只收帧；echo/meta 就地处理，事件进会话队列由 worker 依次处理；连接一关就 `_fail_pending()`，已读入的事件限时排空 | `forward_receive_loop_never_blocks_on_api_calls` / `reverse_receive_loop_never_blocks_on_api_calls` / `drain_processes_events_already_read_when_peer_closes` |
+| 收包 | 多账号时追问 `get_forward_msg` 走了主连接而不是收到事件的连接 | `_call_via(session)` | `multi_account_forward_lookup_uses_the_receiving_session` |
+| 收包 | `get_forward_msg` 只发 `message_id`，且只认一种返回结构 | 同时发 `id` 与 `message_id`；兼容列表 / `{"messages"}` / `{"message":[node]}` | `get_forward_msg_accepts_real_world_shapes` |
+| 反向 | 无 token 时对 `0.0.0.0` 开放监听：任何人可顶掉 NapCat 并伪造事件 | 非回环无 token 拒绝监听（`reverse_allow_no_token` 显式放开） | `reverse_listener_refuses_open_non_loopback_bind`；`core: reverse_listener_without_token_is_refused_not_crashed` |
+| 反向 | 先升级再以 1008 关闭；非 ASCII token 令鉴权比较抛异常 | 握手前 404/401/503；UTF-8 字节比较 | `reverse_handshake_rejected_before_upgrade` / `non_ascii_token_never_raises` |
+| 反向 | 多账号会话数无上限 | 上限 32，已知账号重连不受限 | `reverse_session_cap_only_blocks_new_accounts` |
+| 重试 | 发送超时被当作“没发出”，对慢 NapCat 无限重发 | 超时占用一次尝试并至少等一个请求超时；总数受 `outbox_max_attempts` 限制 | `slow_ack_does_not_resend_forever`；`e2e: scenario_slow_ack` |
+| 限速 | outbox 补发绕过限速，重连后一次倾泻整个积压 | 补发每条取一个限速槽；一次逻辑消息只取一个槽 | `outbox_replay_takes_a_rate_slot_per_message`；`core: a_long_reply_consumes_one_rate_slot` |
+| 出站 | 长回复一条失败后仍继续发后面的分片；引用发送超时后补发无引用副本 | 分片失败即停；传输异常/超时不补发副本 | `passive_long_text_is_split_per_message_and_stops_on_failure` / `quoted_send_timeout_is_not_retried_unquoted` |
+| 媒体 | 工具的 `image_url` 可让 Octop 读取服务器上任意文件 | 仅 `media_allowed_dirs` 内的普通文件；realpath、`O_NOFOLLOW`、大小与魔数检查 | `local_media_is_confined_to_allowed_dirs` |
+| outbox | 状态文件权限宽松；加载时信任文件内容，可被改成任意 OneBot 动作 | 文件 `0600`；动作白名单、参数/字节预算校验 | `outbox_state_file_is_private_and_validated` |
+| HTTP 回退 | 读取响应无上限；无应答超时被当成连接失败（等同“没发出”） | 响应上限 2 MiB；超时按 `TimeoutError`（送达未知）处理 | `http_fallback_has_response_cap_and_distinct_timeout` |
+| 提示注入 | 巡检摘要把群友原文直接拼进给模型的提示 | 单行中和 + 随机围栏 + “围栏内是数据”声明 | `monitor_digest_neutralizes_untrusted_text` |
+| 入站策略 | 戳一戳、自动通过好友/群邀请绕过发送人黑白名单；戳一戳可刷屏 | 共用 `_sender_allowed()`；戳一戳 10 秒冷却 | `poke_honours_sender_policy_and_cooldown` / `auto_accept_obeys_sender_policy` |
+| 入站 | 去重键只含 message_id，跨账号/会话会误吞；CQ 字符串里的转义（`&#91;`、`&amp;`）原样进入文本；Unicode 数字被当 QQ 号 | 键含 `self_id\|类型\|会话\|message_id`；CQ 转义还原且只还原一次；ID 仅接受 ASCII 数字 | `message_dedupe_is_scoped_by_account_and_chat` / `cq_codes_are_unescaped_once` / `numeric_ids_ignore_unicode_digits` |
+| 群上下文 | metadata 缺 `sender_id`，群历史发送者全是 `unknown`；`always` 被核心降级为 `mention` | 写入 `sender_id`；`always` 同时声明 `visibility=all` | `sender_policy_and_sender_id_metadata` / `always_mode_declares_full_visibility`；`core: mention_mode_buffers_chatter_with_the_real_group_policy` / `always_mode_is_not_degraded_by_the_core` |
+| 配置 | 表单字符串（`"3002"`、`"true"`、空值）让构造抛 `ValueError` | `__post_init__` 统一转换，非法值回退默认并告警 | `config_values_are_normalized`；`core: dashboard_payload_builds_a_working_channel` |
+| 日志 | URL 里的凭据进了日志和状态栏 | `_redact_url()` | `urls_are_redacted_in_logs_and_status` |
+| 注册表 | 旧实例停止时把同 ID 的新实例踢出注册表 | 按实例身份注销 | `live_registry_is_identity_checked` |
+| 工具 | 多通道/多 Agent 时按“第一个通道”发送，Agent 之间可串用；`group_id` 不校验 | 每 Agent `channel_id` 绑定（模型参数不能改道）；未绑定多通道拒绝；ID 仅接受 ASCII 数字 | `tools_are_bound_to_one_channel_per_agent` / `tools_register_a_channel_binding_field`；`core: tools_honour_the_per_agent_channel_binding` |
+| 脚本 | 令牌写进命令行/远程 shell 引号拼接；`/tmp` 固定路径；示例里带现网 IP 与 ID | 令牌走环境变量或 stdin；`mktemp -d`；单引号校验；示例改占位符；`install.ps1` 参数化且不创建通道 | 手工/静态检查（无单测） |
+
+### 13.1 取舍与注意
+
+- **兼容性**：默认行为有三处收紧——反向监听非回环地址必须有 token；本地图片路径默认不可用；多通道且未绑定时工具拒绝发送。升级后若现网依赖旧行为，需要分别配置 `token` / `media_allowed_dirs` / 工具的 `channel_id`。
+- **投递语义**：至少一次，不是恰好一次（见 design.md 7.1）。
+- **未覆盖**：`install.ps1` 没有在 Windows 上实跑；`get_forward_msg` 的返回结构只对 mock 与单元用例验证过；没有接入真实 QQ 账号做端到端联调。
+
+## 14. 发布与交接
 
 ### 发布
 
-1. 更新 `plugins/*/plugin.yaml` 的 `version`。
+1. 更新 `plugins/*/plugin.yaml` 的 `version`，同时更新 README 徽章与本文件开头的“当前版本”（`test_plugin_regression.py` 的 `docs_and_manifests_agree_on_version` 会检查三者一致）。
 2. 更新 README 变更说明。
-3. 打 tag：`git tag v0.3.0 && git push origin v0.3.0`。
-4. `gh release create v0.3.0 --generate-notes`。
+3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。
+4. `gh release create vX.Y.Z --generate-notes`。
 5. 部署验证：`plugin install --force` → `restart` → 日志确认 `applied ... onebot11`。
 
 ### 交接清单
@@ -578,11 +643,11 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 - [ ] 仓库权限：至少 `write`，CI 可读。
 - [ ] 部署环境：Octop 数据目录、容器名、Compose 文件位置（**不要写进仓库**）。
 - [ ] NapCat 账号：由业务方持有，开发者只需要测试号。
-- [ ] 现网通道 ID 与 Agent ID：单独记录，不提交到仓库。
+- [ ] 现网通道 ID 与 Agent ID、服务器地址：单独记录，不提交到仓库（示例一律用占位符）。
 - [ ] 已知问题：见第 7 节；未完成事项：见第 8 节路线图。
 - [ ] 密钥：仓库内不得出现 token；配置只存 Octop DB。
 
-## 14. 参考
+## 15. 参考
 
 - Octop：<https://github.com/TencentCloud/Octop>
 - octop-gateway：<https://github.com/TencentCloud/octop-gateway>

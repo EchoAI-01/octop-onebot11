@@ -43,16 +43,16 @@ filenames (no cache problem) but also a pristine bundle — re-run this script.
 Examples
 --------
     # Patch a remote host (self-uploads, runs with the octop venv python):
-    python3 scripts/patch_dashboard.py --host root@43.155.171.15
+    python3 scripts/patch_dashboard.py --host user@octop-host
 
     # Run directly on the Octop host:
     python3 scripts/patch_dashboard.py
 
     # Inspect without writing:
-    python3 scripts/patch_dashboard.py --host root@43.155.171.15 --dry-run
+    python3 scripts/patch_dashboard.py --host user@octop-host --dry-run
 
     # Roll back:
-    python3 scripts/patch_dashboard.py --host root@43.155.171.15 --restore
+    python3 scripts/patch_dashboard.py --host user@octop-host --restore
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -401,7 +402,6 @@ def run_local(args: argparse.Namespace) -> None:
 def run_remote(args: argparse.Namespace) -> None:
     """Upload this script to the host and execute it with the octop venv python."""
     self_path = os.path.abspath(__file__)
-    remote_script = "/tmp/_patch_dashboard_remote.py"
     forwarded: list[str] = []
     if args.dashboard_dir:
         forwarded += ["--dashboard-dir", args.dashboard_dir]
@@ -409,22 +409,35 @@ def run_remote(args: argparse.Namespace) -> None:
         forwarded.append("--dry-run")
     if args.restore:
         forwarded.append("--restore")
-    scp = subprocess.run(["scp", "-q", self_path, f"{args.host}:{remote_script}"],
-                         capture_output=True, text=True)
-    if scp.returncode != 0:
-        die(f"scp failed: {scp.stderr.strip()}")
-    remote_cmd = (
-        f"if [ -x /opt/octop/venv/bin/python ]; then PY=/opt/octop/venv/bin/python; "
-        f"else PY=python3; fi; $PY {remote_script} {' '.join(forwarded)}"
-    )
-    result = subprocess.run(["ssh", args.host, remote_cmd], text=True)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
+    # The script runs as the (usually root) SSH user: stage it in a private,
+    # freshly created directory rather than a predictable /tmp path.
+    made = subprocess.run(["ssh", args.host, "mktemp -d"], capture_output=True, text=True)
+    remote_dir = made.stdout.strip()
+    if made.returncode != 0 or not remote_dir.startswith("/"):
+        die(f"cannot create a remote temp dir: {made.stderr.strip() or made.stdout.strip()}")
+    remote_script = f"{remote_dir}/patch_dashboard.py"
+    returncode = 1
+    try:
+        scp = subprocess.run(["scp", "-q", self_path, f"{args.host}:{remote_script}"],
+                             capture_output=True, text=True)
+        if scp.returncode != 0:
+            die(f"scp failed: {scp.stderr.strip()}")
+        remote_cmd = (
+            "if [ -x /opt/octop/venv/bin/python ]; then PY=/opt/octop/venv/bin/python; "
+            f"else PY=python3; fi; $PY {shlex.quote(remote_script)} "
+            + " ".join(shlex.quote(part) for part in forwarded)
+        )
+        returncode = subprocess.run(["ssh", args.host, remote_cmd], text=True).returncode
+    finally:
+        subprocess.run(["ssh", args.host, f"rm -rf {shlex.quote(remote_dir)}"],
+                       capture_output=True, text=True)
+    if returncode != 0:
+        sys.exit(returncode)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--host", help="ssh target, e.g. root@43.155.171.15 (omit to run locally)")
+    parser.add_argument("--host", help="ssh target, e.g. user@octop-host (omit to run locally)")
     parser.add_argument("--dashboard-dir", help="octop dashboard dir (default: auto-detect)")
     parser.add_argument("--dry-run", action="store_true", help="report without writing")
     parser.add_argument("--restore", action="store_true", help="restore the pre-patch backup")
