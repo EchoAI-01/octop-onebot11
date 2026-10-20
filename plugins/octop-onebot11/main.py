@@ -30,11 +30,14 @@ import contextlib
 import hmac
 import json
 import logging
+import os
 import random
 import re
 import time
+import urllib.error
+import urllib.request
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -75,38 +78,41 @@ def get_live_channel(channel_id: str = "") -> "OneBot11Channel | None":
     return next(iter(_LIVE_CHANNELS.values()), None)
 
 
-def build_group_subject(group_id: str) -> "ChannelSubject":
+def build_group_subject(group_id: str, self_id: str = "") -> "ChannelSubject":
     """Build a proactive group subject from a bare group id."""
     gid = str(group_id or "").strip()
-    return ChannelSubject(
-        subject_id=f"group:{gid}",
-        chat_type="group",
-        metadata={
-            "group_id": gid,
-            "chat_type": "group",
-            "message_type": "group",
-            "strict_push": True,
-        },
-    )
+    account = str(self_id or "").strip()
+    metadata = {
+        "group_id": gid,
+        "chat_type": "group",
+        "message_type": "group",
+        "strict_push": True,
+    }
+    if account:
+        # Multi-account routing: send through this QQ's connection.
+        metadata["self_id"] = account
+    return ChannelSubject(subject_id=f"group:{gid}", chat_type="group", metadata=metadata)
 
 
-def build_private_subject(user_id: str) -> "ChannelSubject":
+def build_private_subject(user_id: str, self_id: str = "") -> "ChannelSubject":
     """Build a proactive private subject from a bare QQ user id."""
     uid = str(user_id or "").strip()
-    return ChannelSubject(
-        subject_id=f"user:{uid}",
-        chat_type="dm",
-        metadata={
-            "user_id": uid,
-            "chat_type": "dm",
-            "message_type": "private",
-            "strict_push": True,
-        },
-    )
+    account = str(self_id or "").strip()
+    metadata = {
+        "user_id": uid,
+        "chat_type": "dm",
+        "message_type": "private",
+        "strict_push": True,
+    }
+    if account:
+        metadata["self_id"] = account
+    return ChannelSubject(subject_id=f"user:{uid}", chat_type="dm", metadata=metadata)
 
 _CQ_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)((?:,[^\]]*)?)\]")
 _MAX_DEDUPE = 512
 _MAX_MEDIA_BYTES = 10 * 1024 * 1024
+_MONITOR_BUFFER_CAP = 50
+_MONITOR_SKIP_TEXTS = frozenset({"〔巡检跳过〕", "巡检跳过"})
 
 
 def _to_bool(value: Any) -> bool:
@@ -122,6 +128,24 @@ def _to_int(value: Any, default: int) -> int:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _split_id_list(raw: Any) -> frozenset[str]:
+    """Parse a comma-separated id list (or an iterable) into a set of strings."""
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(item).strip() for item in raw]
+    else:
+        text = str(raw or "").replace("，", ",").replace("\n", ",")
+        items = [item.strip() for item in text.split(",")]
+    return frozenset(item for item in items if item)
+
 
 
 def _normalize_path(value: Any) -> str:
@@ -142,6 +166,40 @@ class OneBotAPIError(RuntimeError):
         self.retcode = retcode
         self.message = message
         super().__init__(f"OneBot {action} failed (retcode={retcode}): {message}")
+
+
+@dataclass
+class _OutboxItem:
+    """One queued proactive message waiting for a healthy connection."""
+
+    action: str
+    params: dict[str, Any]
+    queued_at: float
+    attempts: int = 0
+    next_try: float = 0.0
+    account: str = ""
+
+
+@dataclass
+class _ConnSession:
+    """One live OneBot connection (reverse client or forward dial).
+
+    Sessions exist only while their socket is attached; aggregate channel
+    state (``_ws`` / ``_connected_transport`` / ``_login_confirmed`` /
+    ``_self_id``) is derived from the session map so single-account
+    behaviour stays identical to the pre-multi-account code.
+    """
+
+    key: str
+    ws: Any
+    remote: str = ""
+    self_id: str = ""
+    login_confirmed: bool = False
+    probe_task: asyncio.Task[None] | None = None
+    pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+
+
+_OUTBOX_FLUSH_INTERVAL = 2.0
 
 
 @dataclass
@@ -181,6 +239,42 @@ class OneBot11Config(ChannelConfig):
     reconnect_min_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
     max_text_chars: int = 1500
+    # Outbound policy: empty whitelist entries mean "no restriction".
+    allowed_groups: str = ""
+    allowed_users: str = ""
+    send_rate_limit_count: int = 20
+    send_rate_limit_window: float = 60.0
+    # In-memory outbox for proactive (strict) sends while disconnected.
+    outbox_enabled: bool = True
+    outbox_max_items: int = 100
+    outbox_ttl_seconds: float = 3600.0
+    outbox_max_attempts: int = 3
+    outbox_retry_min_seconds: float = 2.0
+    outbox_retry_max_seconds: float = 60.0
+    # Outbox persistence: survive Octop restarts (file-based, per channel).
+    outbox_persist: bool = True
+    outbox_persist_dir: str = ""  # empty -> ~/.octop/onebot11/state
+    # Reverse mode: accept multiple concurrent NapCat accounts (routing by self_id).
+    multi_account: bool = False
+    # Inbound sender policy: empty means no restriction; blacklist wins.
+    allowed_senders: str = ""
+    blocked_senders: str = ""
+    # Event handling.
+    poke_triggers_reply: bool = False
+    auto_accept_friend_request: bool = False
+    auto_accept_group_invite: bool = False
+    resolve_forward: bool = False
+    # OneBot HTTP API fallback for outbound actions while WS is down.
+    http_api_url: str = ""
+    http_api_token: str = ""
+    http_api_timeout_seconds: float = 10.0
+    # Group monitor: periodic digest of non-triggering group messages.
+    monitor_enabled: bool = False
+    monitor_interval_seconds: float = 600.0
+    monitor_min_messages: int = 5
+    monitor_keywords: str = ""
+    monitor_min_trigger_gap_seconds: float = 1800.0
+    monitor_max_per_hour: int = 4
     group_context: GroupContextConfig = field(
         default_factory=lambda: GroupContextConfig(
             enabled=True,
@@ -200,6 +294,33 @@ class OneBot11Config(ChannelConfig):
         self.reply_with_quote = _to_bool(self.reply_with_quote)
         self.ignore_self_message = _to_bool(self.ignore_self_message)
         self.keyword_case_sensitive = _to_bool(self.keyword_case_sensitive)
+        self.outbox_enabled = _to_bool(self.outbox_enabled)
+        self.outbox_max_items = max(0, _to_int(self.outbox_max_items, 100))
+        self.outbox_ttl_seconds = max(0.0, _to_float(self.outbox_ttl_seconds, 3600.0))
+        self.outbox_max_attempts = max(1, _to_int(self.outbox_max_attempts, 3))
+        self.outbox_retry_min_seconds = max(0.5, _to_float(self.outbox_retry_min_seconds, 2.0))
+        self.outbox_retry_max_seconds = max(
+            self.outbox_retry_min_seconds, _to_float(self.outbox_retry_max_seconds, 60.0)
+        )
+        self.outbox_persist = _to_bool(self.outbox_persist)
+        self.outbox_persist_dir = str(self.outbox_persist_dir or "").strip()
+        self.multi_account = _to_bool(self.multi_account)
+        self.allowed_senders = str(self.allowed_senders or "").strip()
+        self.blocked_senders = str(self.blocked_senders or "").strip()
+        self.poke_triggers_reply = _to_bool(self.poke_triggers_reply)
+        self.auto_accept_friend_request = _to_bool(self.auto_accept_friend_request)
+        self.auto_accept_group_invite = _to_bool(self.auto_accept_group_invite)
+        self.resolve_forward = _to_bool(self.resolve_forward)
+        self.http_api_url = str(self.http_api_url or "").strip()
+        self.http_api_token = str(self.http_api_token or "").strip()
+        self.http_api_timeout_seconds = max(1.0, _to_float(self.http_api_timeout_seconds, 10.0))
+        self.monitor_enabled = _to_bool(self.monitor_enabled)
+        self.monitor_interval_seconds = max(30.0, _to_float(self.monitor_interval_seconds, 600.0))
+        self.monitor_min_messages = max(1, _to_int(self.monitor_min_messages, 5))
+        self.monitor_min_trigger_gap_seconds = max(0.0, _to_float(self.monitor_min_trigger_gap_seconds, 1800.0))
+        self.monitor_max_per_hour = max(1, _to_int(self.monitor_max_per_hour, 4))
+        self.send_rate_limit_count = max(0, _to_int(self.send_rate_limit_count, 20))
+        self.send_rate_limit_window = max(1.0, _to_float(self.send_rate_limit_window, 60.0))
         self.group_context.history_limit = max(0, int(self.group_history_limit))
         self.group_context.history_ttl_seconds = max(0.0, float(self.group_history_ttl_seconds))
         self.connection_mode = self.normalized_mode()
@@ -248,6 +369,10 @@ class OneBot11Channel(BaseChannel):
         debounce_seconds: float = 0.0,
         constraints: ChannelConstraints | None = None,
     ) -> None:
+        # The real BaseChannel.__init__() resolves constraints (calling
+        # self._default_constraints()) before returning, so _config must exist
+        # before super().__init__(); assign again after in case it wraps it.
+        self._config = config
         super().__init__(
             processor,
             channel_id=channel_id,
@@ -258,19 +383,29 @@ class OneBot11Channel(BaseChannel):
         )
         self._config = config
         self._keywords = self._parse_keywords(config.trigger_keywords)
+        self._allowed_groups = _split_id_list(config.allowed_groups)
+        self._allowed_users = _split_id_list(config.allowed_users)
+        self._allowed_senders = _split_id_list(config.allowed_senders)
+        self._blocked_senders = _split_id_list(config.blocked_senders)
+        self._monitor_keywords = self._parse_keywords(config.monitor_keywords)
         self._ws: Any = None
         self._task: asyncio.Task[None] | None = None
-        self._probe_task: asyncio.Task[None] | None = None
         self._receiver_task: asyncio.Task[None] | None = None
+        self._outbox_task: asyncio.Task[None] | None = None
         self._server: Any = None
-        self._clients: set[Any] = set()
+        self._session_tasks: set[asyncio.Task[None]] = set()
         self._stopping = False
         self._connected_transport = False
         self._login_confirmed = False
         self._self_id: str = str(config.self_id or "").strip()
         self._runtime_error: str | None = "未启动"
-        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._dedupe: OrderedDict[str, float] = OrderedDict()
+        self._outbox: deque[_OutboxItem] = deque()
+        self._sessions: dict[str, _ConnSession] = {}
+        self._monitor_buffer: dict[str, deque[tuple[str, str, str, float]]] = {}
+        self._monitor_last: dict[str, float] = {}
+        self._monitor_triggers: deque[float] = deque()
+        self._monitor_task: asyncio.Task[None] | None = None
         self._first_attempt: asyncio.Event | None = None
         self._backoff = max(0.5, float(config.reconnect_min_seconds))
         if self.channel_id != "__probe__":
@@ -281,6 +416,7 @@ class OneBot11Channel(BaseChannel):
             config.group_context.activation = "always"
         elif config.group_reply_mode == "off":
             config.group_context.enabled = False
+        self._load_outbox()
 
     # ------------------------------------------------------------------
     # Runtime status (read by Octop's Gateway.get_runtime_status)
@@ -329,35 +465,472 @@ class OneBot11Channel(BaseChannel):
         return str(payload.get("raw_message") or "")
 
     def _default_constraints(self) -> ChannelConstraints:
+        # Defensive: may be invoked by BaseChannel.__init__ before _config lands.
+        config = getattr(self, "_config", None)
+        if config is not None:
+            count = max(0, _to_int(config.send_rate_limit_count, 20))
+            window = max(1.0, _to_float(config.send_rate_limit_window, 60.0))
+        else:
+            count, window = 20, 60.0
         return ChannelConstraints(
             reply_timeout=0.0,
-            send_rate_limit=(20, 60.0),
+            send_rate_limit=(count, window) if count > 0 else None,
             typing_keepalive_interval=0.0,
             show_thinking=False,
             show_tool_hints=False,
         )
 
     async def push_text(self, subject: ChannelSubject, text: str) -> None:
-        """Proactive text send; strict mode raises on real failures.
+        """Proactive text send; strict mode queues or raises on real failures.
 
         Octop's internal push paths (cron / proactive care / team) keep the
         base best-effort semantics.  Tool-driven sends mark the subject with
-        ``strict_push=True`` so the agent gets a real error instead of a silent
-        drop.
+        ``strict_push=True``: delivery failures then either land in the retry
+        outbox (while disconnected, or on transient action errors) or raise so
+        the agent knows the message was not accepted.
         """
         if not (subject.metadata or {}).get("strict_push"):
             return await super().push_text(subject, text)
-        if not self._connected_transport:
-            raise ConnectionError("OneBot 11 未连接（NapCat 未登录或 WebSocket 未就绪）")
-        chunks = self._split_text(text)
+        await self.push_segments(subject, [{"type": "text", "data": {"text": text}}])
+
+    async def push_segments(self, subject: ChannelSubject, segments: list[dict[str, Any]]) -> None:
+        """Strict proactive send of mixed OneBot segments (at / image / text).
+
+        Long text is split into multiple messages; non-text segments ride on
+        the first one.  Local file paths in media segments are inlined as
+        base64.  When the transport is down (or fails mid-batch) the remaining
+        messages are parked in the outbox instead of raising, unless the
+        outbox is disabled or full.
+        """
+        denial = self._send_denial(subject)
+        if denial:
+            raise PermissionError(denial)
+        account = str((subject.metadata or {}).get("self_id") or "").strip()
+        if account and self._select_session(account) is None:
+            raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
+        cleaned = [seg for seg in segments if isinstance(seg, dict)]
+        cleaned = [self._materialize_media_segment(seg) for seg in cleaned]
+        cleaned = self._reply_segments_first(cleaned)
+        chunks = self._compose_push_chunks(cleaned)
         if not chunks:
             return
-        await self._acquire_rate_slot()
         resolved = self.resolve_push_subject(subject)
+        prepared: list[tuple[str, dict[str, Any], str]] = []
         for chunk in chunks:
-            segments = [{"type": "text", "data": {"text": chunk}}]
-            action, params = self._build_send_action(resolved, segments)
-            await self._call_api(action, {**params, "message": segments})
+            action, params = self._build_send_action(resolved, chunk)
+            prepared.append((action, {**params, "message": chunk}, account))
+
+        if self._connected_transport or self._http_available():
+            await self._acquire_rate_slot()
+            for index, (action, params, item_account) in enumerate(prepared):
+                try:
+                    await self._call_api(action, params, account=item_account)
+                except Exception as exc:  # noqa: BLE001 - queue the rest, re-raise only if parking fails
+                    if self._enqueue_outbox(prepared[index:], cause=exc):
+                        return
+                    raise
+            return
+        if self._enqueue_outbox(prepared):
+            return
+        raise ConnectionError("OneBot 11 未连接（NapCat 未登录或 WebSocket 未就绪），且待发队列不可用")
+
+    def _http_available(self) -> bool:
+        return bool(str(self._config.http_api_url or "").strip())
+
+    @staticmethod
+    def _reply_segments_first(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """OneBot expects a ``reply`` segment to lead the message."""
+        replies = [seg for seg in segments if str(seg.get("type") or "") == "reply"]
+        if not replies:
+            return segments
+        rest = [seg for seg in segments if str(seg.get("type") or "") != "reply"]
+        return [*replies, *rest]
+
+    async def push_forward(self, subject: ChannelSubject, nodes: list[dict[str, Any]]) -> None:
+        """Strict proactive merged-forward send (groups only)."""
+        if not isinstance(nodes, list) or not nodes or not all(isinstance(node, dict) for node in nodes):
+            raise ValueError("合并转发内容必须是非空节点数组")
+        denial = self._send_denial(subject)
+        if denial:
+            raise PermissionError(denial)
+        resolved = self.resolve_push_subject(subject)
+        action, params = self._build_send_action(resolved, [])
+        if action != "send_group_msg":
+            raise ValueError("合并转发仅支持群聊")
+        account = str((subject.metadata or {}).get("self_id") or "").strip()
+        if account and self._select_session(account) is None:
+            raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
+        if not self._connected_transport and not self._http_available():
+            raise ConnectionError("OneBot 11 未连接（NapCat 未登录或 WebSocket 未就绪）")
+        await self._acquire_rate_slot()
+        await self._call_api("send_group_forward_msg", {**params, "messages": nodes}, account=account)
+
+    def _compose_push_chunks(self, segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Split mixed segments into sendable messages (long text chunked)."""
+        if not segments:
+            return []
+        media = [seg for seg in segments if str(seg.get("type") or "") != "text"]
+        texts = [
+            str((seg.get("data") or {}).get("text") or "")
+            for seg in segments
+            if str(seg.get("type") or "") == "text"
+        ]
+        text = "\n".join(part for part in texts if part)
+        text_pieces = self._split_text(text) if text.strip() else []
+        chunks: list[list[dict[str, Any]]] = []
+        for piece in text_pieces:
+            chunks.append([*media, {"type": "text", "data": {"text": piece}}])
+            media = []
+        if not chunks and media:
+            chunks.append(list(media))
+        return chunks
+
+    def _materialize_media_segment(self, seg: dict[str, Any]) -> dict[str, Any]:
+        """Inline a local file path in a media segment as base64 payload."""
+        if str(seg.get("type") or "") not in ("image", "record", "video", "file"):
+            return seg
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        file_value = str(data.get("file") or "")
+        if not file_value or file_value.startswith(("http://", "https://", "base64://")):
+            return seg
+        if not os.path.isfile(file_value):
+            # Unknown scheme: pass through and let the OneBot server judge it.
+            return seg
+        size = os.path.getsize(file_value)
+        if size > _MAX_MEDIA_BYTES:
+            raise ValueError(f"媒体文件超过 {_MAX_MEDIA_BYTES} 字节上限: {file_value}")
+        with open(file_value, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+        return {**seg, "data": {**data, "file": f"base64://{encoded}"}}
+
+    def _send_denial(self, subject: ChannelSubject) -> str | None:
+        """Return a human-readable denial reason, or None when allowed."""
+        if not self._allowed_groups and not self._allowed_users:
+            return None
+        action, params = self._build_send_action(subject, [])
+        target = str(params.get("group_id") or params.get("user_id") or "")
+        if action == "send_group_msg" and self._allowed_groups and target not in self._allowed_groups:
+            return f"目标群 {target} 不在 allowed_groups 白名单"
+        if action == "send_private_msg" and self._allowed_users and target not in self._allowed_users:
+            return f"目标用户 {target} 不在 allowed_users 白名单"
+        return None
+
+    # ------------------------------------------------------------------
+    # Proactive outbox (in-memory; survives NapCat restarts, not Octop restarts)
+    # ------------------------------------------------------------------
+
+    def _enqueue_outbox(
+        self,
+        prepared: list[tuple[str, dict[str, Any], str]],
+        cause: BaseException | None = None,
+    ) -> bool:
+        """Park prepared messages for retry; False means the caller must raise."""
+        if not prepared or not self._config.outbox_enabled:
+            return False
+        limit = int(self._config.outbox_max_items)
+        if len(self._outbox) + len(prepared) > limit:
+            logger.warning(
+                "OneBot11 outbox full (%d/%d), strict push rejected",
+                len(self._outbox),
+                limit,
+            )
+            return False
+        now = time.monotonic()
+        for action, params, account in prepared:
+            self._outbox.append(
+                _OutboxItem(
+                    action=action,
+                    params=params,
+                    queued_at=now,
+                    attempts=0,
+                    next_try=now,
+                    account=account,
+                )
+            )
+        logger.info(
+            "OneBot11 queued %d message(s) for retry (outbox=%d, cause=%s)",
+            len(prepared),
+            len(self._outbox),
+            cause.__class__.__name__ if cause is not None else "disconnected",
+        )
+        self._persist_outbox()
+        return True
+
+    def _outbox_backoff(self, attempts: int) -> float:
+        low = max(0.5, float(self._config.outbox_retry_min_seconds))
+        high = max(low, float(self._config.outbox_retry_max_seconds))
+        return min(high, low * (2 ** max(0, attempts - 1)))
+
+    def _ensure_outbox_task(self) -> None:
+        if self._outbox_task is None or self._outbox_task.done():
+            self._outbox_task = asyncio.create_task(
+                self._outbox_flush_loop(),
+                name=f"onebot11-outbox-{self.channel_id}",
+            )
+
+    async def _outbox_flush_loop(self) -> None:
+        while not self._stopping:
+            try:
+                if (self.is_connected or self._http_available()) and self._outbox:
+                    await self._flush_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive
+                logger.exception("OneBot11 outbox flush failed")
+            await asyncio.sleep(_OUTBOX_FLUSH_INTERVAL)
+
+    async def _flush_outbox(self) -> None:
+        """Deliver due items in order; drop expired / exhausted ones."""
+        now = time.monotonic()
+        ttl = max(0.0, float(self._config.outbox_ttl_seconds))
+        changed = False
+        while self._outbox:
+            head = self._outbox[0]
+            if ttl and now - head.queued_at > ttl:
+                expired = self._outbox.popleft()
+                changed = True
+                logger.warning(
+                    "OneBot11 outbox item expired (ttl=%ss): %s", ttl, expired.action
+                )
+                continue
+            break
+        sent = 0
+        while self._outbox:
+            item = self._outbox[0]
+            if now < item.next_try:
+                break
+            if item.attempts >= int(self._config.outbox_max_attempts):
+                exhausted = self._outbox.popleft()
+                changed = True
+                logger.warning(
+                    "OneBot11 outbox item exceeded max attempts (%d): %s",
+                    int(self._config.outbox_max_attempts),
+                    exhausted.action,
+                )
+                continue
+            try:
+                await self._call_api(item.action, item.params, account=item.account)
+            except OneBotAPIError as exc:
+                item.attempts += 1
+                item.next_try = now + self._outbox_backoff(item.attempts)
+                self._outbox.popleft()
+                self._outbox.append(item)
+                changed = True
+                logger.info(
+                    "OneBot11 outbox retry #%d scheduled for %s: %s",
+                    item.attempts,
+                    item.action,
+                    exc,
+                )
+                break
+            except (ConnectionError, ConnectionClosed, OSError, TimeoutError, asyncio.TimeoutError):
+                break
+            self._outbox.popleft()
+            sent += 1
+            changed = True
+        if sent:
+            logger.info("OneBot11 outbox delivered %d message(s), %d remaining", sent, len(self._outbox))
+        if changed:
+            self._persist_outbox()
+
+    # ------------------------------------------------------------------
+    # Outbox persistence (file-based, per channel; survives Octop restarts)
+    # ------------------------------------------------------------------
+
+    def _persist_path(self) -> str:
+        if not self._config.outbox_persist or self.channel_id == "__probe__":
+            return ""
+        base = self._config.outbox_persist_dir or os.path.join(
+            os.path.expanduser("~"), ".octop", "onebot11", "state"
+        )
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.channel_id)) or "channel"
+        return os.path.join(base, f"{safe}.json")
+
+    def _persist_outbox(self) -> None:
+        """Atomically dump the outbox so a restart can drain it later."""
+        path = self._persist_path()
+        if not path:
+            return
+        if not self._outbox and not os.path.exists(path):
+            return
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        payload = {
+            "version": 1,
+            "items": [
+                {
+                    "action": item.action,
+                    "params": item.params,
+                    "queued_at": now_epoch - max(0.0, now_mono - item.queued_at),
+                    "attempts": item.attempts,
+                    "account": item.account,
+                }
+                for item in self._outbox
+            ],
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, path)
+        except (OSError, ValueError) as exc:
+            logger.warning("OneBot11 outbox persist failed: %s", exc)
+
+    def _load_outbox(self) -> None:
+        """Restore queued messages written by a previous process."""
+        path = self._persist_path()
+        if not path or not self._config.outbox_enabled:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            logger.warning("OneBot11 outbox state corrupt, ignoring: %s", path)
+            return
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        limit = max(0, int(self._config.outbox_max_items))
+        for raw in items[:limit]:
+            if not isinstance(raw, dict):
+                continue
+            action = str(raw.get("action") or "")
+            params = raw.get("params")
+            if not action or not isinstance(params, dict):
+                continue
+            try:
+                queued_epoch = float(raw.get("queued_at") or now_epoch)
+            except (TypeError, ValueError):
+                queued_epoch = now_epoch
+            age = max(0.0, now_epoch - queued_epoch)
+            self._outbox.append(
+                _OutboxItem(
+                    action=action,
+                    params=params,
+                    queued_at=now_mono - age,
+                    attempts=max(0, _to_int(raw.get("attempts"), 0)),
+                    next_try=now_mono,
+                    account=str(raw.get("account") or ""),
+                )
+            )
+        if self._outbox:
+            logger.info(
+                "OneBot11 restored %d outbox item(s) from %s", len(self._outbox), path
+            )
+
+    # ------------------------------------------------------------------
+    # Group monitor (periodic digest of non-triggering messages)
+    # ------------------------------------------------------------------
+
+    def _ensure_monitor_task(self) -> None:
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(
+                self._monitor_loop(),
+                name=f"onebot11-monitor-{self.channel_id}",
+            )
+
+    async def _monitor_loop(self) -> None:
+        interval = max(30.0, float(self._config.monitor_interval_seconds))
+        while not self._stopping:
+            await asyncio.sleep(interval)
+            if self._stopping:
+                return
+            try:
+                self._monitor_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive
+                logger.exception("OneBot11 monitor sweep failed")
+
+    def _monitor_keyword_hit(self, text: str) -> bool:
+        """True when the monitor keyword filter allows this text."""
+        if not self._monitor_keywords:
+            return True
+        haystack = text if self._config.keyword_case_sensitive else text.casefold()
+        return any(keyword in haystack for keyword in self._monitor_keywords)
+
+    def _monitor_record(self, group_id: str, user_id: str, name: str, text: str) -> None:
+        if not group_id or not text.strip():
+            return
+        buffer = self._monitor_buffer.setdefault(group_id, deque(maxlen=_MONITOR_BUFFER_CAP))
+        buffer.append((user_id, name, text[:160], time.monotonic()))
+
+    def _monitor_sweep(self) -> None:
+        """Check buffers and synthesize one digest trigger per eligible group."""
+        if self._stopping or not self._config.monitor_enabled:
+            return
+        if self._config.group_reply_mode == "off":
+            return
+        now = time.monotonic()
+        while self._monitor_triggers and now - self._monitor_triggers[0] > 3600.0:
+            self._monitor_triggers.popleft()
+        if len(self._monitor_triggers) >= max(1, int(self._config.monitor_max_per_hour)):
+            return
+        horizon = max(60.0, 2.0 * float(self._config.monitor_interval_seconds))
+        for group_id in list(self._monitor_buffer.keys()):
+            buffer = self._monitor_buffer.get(group_id)
+            if not buffer:
+                continue
+            while buffer and now - buffer[0][3] > horizon:
+                buffer.popleft()
+            if len(buffer) < max(1, int(self._config.monitor_min_messages)):
+                continue
+            if now - self._monitor_last.get(group_id, 0.0) < max(
+                0.0, float(self._config.monitor_min_trigger_gap_seconds)
+            ):
+                continue
+            if not any(self._monitor_keyword_hit(entry[2]) for entry in buffer):
+                continue
+            count = len(buffer)
+            lines = [
+                f"{name or user_id}（{user_id}）: {text}"
+                for user_id, name, text, _ in list(buffer)
+            ]
+            buffer.clear()
+            self._monitor_last[group_id] = now
+            self._monitor_triggers.append(now)
+            digest = (
+                f"【群巡检】群 {group_id} 自上次检查以来有 {count} 条未触发回复的消息：\n"
+                + "\n".join(lines[:20])
+                + "\n请判断是否需要回应群友。若认为无需介入，请只回复：〔巡检跳过〕"
+            )
+            self.enqueue(self._synthetic_message("group", group_id, digest, "_octop_monitor"))
+            logger.info(
+                "OneBot11 monitor triggered for group %s (%d messages)", group_id, count
+            )
+
+    def _synthetic_message(
+        self,
+        message_type: str,
+        key: str,
+        text: str,
+        marker: str,
+        *,
+        sender_name: str = "群巡检",
+    ) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "post_type": "message",
+            "message_type": message_type,
+            "sub_type": "normal",
+            "message_id": f"{marker}-{uuid.uuid4().hex}",
+            "user_id": 0,
+            "self_id": self._self_id or 0,
+            "time": int(time.time()),
+            "message": [{"type": "text", "data": {"text": text}}],
+            "raw_message": "",
+            "sender": {"user_id": 0, "nickname": sender_name, "card": sender_name},
+            marker: True,
+        }
+        if message_type == "group":
+            event["group_id"] = int(key) if str(key).isdigit() else key
+        else:
+            event["user_id"] = int(key) if str(key).isdigit() else key
+        return event
 
     def _enrich_push_metadata(
         self,
@@ -407,6 +980,9 @@ class OneBot11Channel(BaseChannel):
         self._first_attempt = asyncio.Event()
         runner = self._serve_forever if reverse else self._run_forever
         self._task = asyncio.create_task(runner(), name=f"onebot11-{self.channel_id}")
+        self._ensure_outbox_task()
+        if self._config.monitor_enabled:
+            self._ensure_monitor_task()
 
         # Give the first attempt a short window so the dashboard shows a useful
         # state right after creation.  Never propagate connection failures.
@@ -419,7 +995,7 @@ class OneBot11Channel(BaseChannel):
             pass
 
     async def stop(self) -> None:
-        """Cancel the supervisor and close the socket."""
+        """Cancel the supervisor and close every session."""
         self._stopping = True
         task, self._task = self._task, None
         if task is not None:
@@ -427,16 +1003,21 @@ class OneBot11Channel(BaseChannel):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
-        for probe_task in (self._probe_task, self._receiver_task):
+        for probe_task in (self._receiver_task, self._outbox_task, self._monitor_task):
             if probe_task is not None and not probe_task.done():
                 probe_task.cancel()
-        self._probe_task = None
         self._receiver_task = None
+        self._outbox_task = None
+        self._monitor_task = None
 
-        clients, self._clients = list(self._clients), set()
-        for client in clients:
+        # Persist queued proactive messages so a restart can drain them later.
+        self._persist_outbox()
+
+        for session in list(self._sessions.values()):
             with contextlib.suppress(Exception):
-                await client.close()
+                await self._remove_session(session, reason="channel stopped", close_code=1001)
+        self._sessions.clear()
+        self._refresh_state()
 
         server, self._server = self._server, None
         if server is not None:
@@ -447,12 +1028,6 @@ class OneBot11Channel(BaseChannel):
                 with contextlib.suppress(Exception):
                     await wait_closed()
 
-        ws, self._ws = self._ws, None
-        if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
-
-        self._fail_pending(ConnectionError("OneBot 11 channel stopped"))
         self._connected_transport = False
         self._login_confirmed = False
         self._self_id = str(self._config.self_id or "").strip()
@@ -483,12 +1058,12 @@ class OneBot11Channel(BaseChannel):
                     self._runtime_error = f"connect_failed: {exc}"
                     logger.exception("OneBot11 WS unexpected error")
                 finally:
-                    self._connected_transport = False
-                    self._login_confirmed = False
-                    self._ws = None
+                    for stale in list(self._sessions.values()):
+                        with contextlib.suppress(Exception):
+                            await self._remove_session(stale, reason="supervisor cycle")
+                    self._refresh_state()
                     if not self._stopping and self._runtime_error is None:
                         self._runtime_error = "连接已断开"
-                    self._fail_pending(ConnectionError("OneBot 11 socket closed"))
                     if first:
                         first = False
                         if self._first_attempt is not None:
@@ -535,24 +1110,28 @@ class OneBot11Channel(BaseChannel):
                 kwargs["extra_headers"] = headers
             ws = await websockets.connect(url, **kwargs)
 
-        self._ws = ws
-        self._connected_transport = True
-        self._login_confirmed = False
+        session = _ConnSession(
+            key=uuid.uuid4().hex,
+            ws=ws,
+            remote=url,
+            self_id=str(self._config.self_id or "").strip(),
+        )
+        self._sessions[session.key] = session
         self._runtime_error = "等待 NapCat 就绪"
         self._backoff = max(0.5, float(self._config.reconnect_min_seconds))
+        self._refresh_state()
         logger.info("OneBot11 WS connected: %s (channel_id=%s)", url, self.channel_id)
 
-        self._receiver_task = asyncio.create_task(self._receiver(ws), name="onebot11-recv")
-        self._probe_task = asyncio.create_task(self._login_probe_loop(ws), name="onebot11-login")
+        self._start_probe(session)
+        self._receiver_task = asyncio.create_task(self._receiver(session), name="onebot11-recv")
         try:
             await self._receiver_task
         finally:
-            for task in (self._probe_task, self._receiver_task):
-                if task is not None and not task.done():
-                    task.cancel()
-            self._probe_task = None
+            if self._receiver_task is not None and not self._receiver_task.done():
+                self._receiver_task.cancel()
             self._receiver_task = None
-            self._connected_transport = False
+            with contextlib.suppress(Exception):
+                await self._remove_session(session, reason="forward closed")
             with contextlib.suppress(Exception):
                 await ws.close()
 
@@ -684,7 +1263,7 @@ class OneBot11Channel(BaseChannel):
         if header_self_id and not self._self_id:
             self._self_id = header_self_id
 
-        await self._attach_client(ws, remote)
+        session = await self._add_session(ws, remote, self_id_hint=header_self_id)
         try:
             async for raw in ws:
                 if isinstance(raw, (bytes, bytearray)):
@@ -695,7 +1274,7 @@ class OneBot11Channel(BaseChannel):
                     logger.debug("OneBot11 ignored non-JSON frame: %.200r", raw)
                     continue
                 if isinstance(payload, dict):
-                    await self._dispatch_payload(payload)
+                    await self._dispatch_payload(payload, session)
         except asyncio.CancelledError:
             raise
         except ConnectionClosed:
@@ -704,54 +1283,152 @@ class OneBot11Channel(BaseChannel):
             self._runtime_error = f"receive_failed: {exc}"
             logger.exception("OneBot11 reverse receive loop failed")
         finally:
-            await self._detach_client(ws, remote)
+            await self._remove_session(session, reason="peer closed")
 
-    async def _attach_client(self, ws: Any, remote: str) -> None:
-        previous = self._ws
-        self._clients.add(ws)
-        self._ws = ws
-        self._connected_transport = True
-        self._login_confirmed = False
+    # ------------------------------------------------------------------
+    # Connection sessions (reverse multi-account + forward single)
+    # ------------------------------------------------------------------
+
+    def _primary_session(self) -> _ConnSession | None:
+        """The session aggregate state is derived from (config self_id, else first)."""
+        if not self._sessions:
+            return None
+        wanted = str(self._config.self_id or "").strip()
+        if wanted:
+            for session in self._sessions.values():
+                if session.self_id == wanted:
+                    return session
+        return next(iter(self._sessions.values()))
+
+    def _select_session(self, account: str = "") -> _ConnSession | None:
+        """Strictly match a session by account (self_id); empty means primary."""
+        account = str(account or "").strip()
+        if not account:
+            return self._primary_session()
+        for session in self._sessions.values():
+            if session.self_id == account:
+                return session
+        return None
+
+    def _refresh_state(self) -> None:
+        """Recompute the aggregate (legacy) channel view from the session map."""
+        primary = self._primary_session()
+        self._ws = primary.ws if primary is not None else None
+        self._connected_transport = bool(self._sessions)
+        self._login_confirmed = any(s.login_confirmed for s in self._sessions.values())
+        if primary is not None and primary.self_id:
+            self._self_id = primary.self_id
+
+    def _register_session_identity(self, session: _ConnSession, self_id: Any) -> None:
+        """Bind a discovered self_id to a session; retire duplicates per account."""
+        self_id = str(self_id or "").strip()
+        if not self_id or session.self_id == self_id:
+            return
+        session.self_id = self_id
+        for other in list(self._sessions.values()):
+            if other is not session and other.self_id == self_id:
+                logger.info(
+                    "OneBot11 replacing stale connection for self_id=%s", self_id
+                )
+                try:
+                    task = asyncio.get_running_loop().create_task(
+                        self._remove_session(other, reason="replaced", close_code=1000)
+                    )
+                except RuntimeError:  # no loop (offline tests): drop bookkeeping only
+                    self._sessions.pop(other.key, None)
+                else:
+                    self._session_tasks.add(task)
+                    task.add_done_callback(self._session_tasks.discard)
+                break
+        self._refresh_state()
+
+    async def _add_session(
+        self,
+        ws: Any,
+        remote: str,
+        self_id_hint: str = "",
+    ) -> _ConnSession:
+        session = _ConnSession(
+            key=uuid.uuid4().hex,
+            ws=ws,
+            remote=remote,
+            self_id=str(self_id_hint or "").strip(),
+        )
+        if not self._config.multi_account:
+            # Single-connection semantics: a new dial retires every previous one.
+            for other in list(self._sessions.values()):
+                await self._remove_session(
+                    other, reason="replaced by a newer connection", close_code=1000
+                )
+        self._sessions[session.key] = session
         self._backoff = max(0.5, float(self._config.reconnect_min_seconds))
         self._runtime_error = "等待 NapCat 就绪"
         logger.info(
-            "OneBot11 reverse WS client connected: %s (clients=%d, channel_id=%s)",
+            "OneBot11 reverse WS client connected: %s (sessions=%d, self_id=%s, channel_id=%s)",
             remote,
-            len(self._clients),
+            len(self._sessions),
+            session.self_id or "?",
             self.channel_id,
         )
-        if self._probe_task is not None and not self._probe_task.done():
-            self._probe_task.cancel()
-        self._probe_task = asyncio.create_task(
-            self._login_probe_loop(ws),
+        self._start_probe(session)
+        if session.self_id:
+            # In multi mode a same-account redial must replace, not duplicate.
+            for other in list(self._sessions.values()):
+                if other is not session and other.self_id == session.self_id:
+                    await self._remove_session(other, reason="replaced", close_code=1000)
+                    break
+        self._refresh_state()
+        return session
+
+    async def _remove_session(
+        self,
+        session: _ConnSession,
+        *,
+        reason: str = "closed",
+        close_code: int | None = None,
+    ) -> None:
+        self._sessions.pop(session.key, None)
+        if session.probe_task is not None and not session.probe_task.done():
+            session.probe_task.cancel()
+        session.probe_task = None
+        for future in session.pending.values():
+            if not future.done():
+                future.set_exception(
+                    ConnectionError(f"OneBot 11 socket closed ({reason})")
+                )
+        session.pending.clear()
+        if close_code is not None:
+            with contextlib.suppress(Exception):
+                await session.ws.close(code=close_code, reason=reason)
+        self._refresh_state()
+        if not self._sessions and not self._stopping:
+            self._runtime_error = "连接已断开，等待 NapCat 重连"
+        logger.info(
+            "OneBot11 session closed: %s (%s, sessions=%d)",
+            session.remote,
+            reason,
+            len(self._sessions),
+        )
+
+    def _start_probe(self, session: _ConnSession) -> None:
+        if session.probe_task is not None and not session.probe_task.done():
+            session.probe_task.cancel()
+        session.probe_task = asyncio.create_task(
+            self._login_probe_loop(session),
             name="onebot11-login",
         )
-        if previous is not None and previous is not ws:
-            # One QQ account normally opens a single reverse connection.  A new
-            # one usually means NapCat reconnected before the old socket timed
-            # out, so keep the newest and retire the stale one.
-            logger.info("OneBot11 reverse WS replacing previous client: %s", remote)
-            with contextlib.suppress(Exception):
-                await previous.close(code=1000, reason="replaced by a newer connection")
+
+    async def _attach_client(self, ws: Any, remote: str) -> _ConnSession:
+        """Backward-compatible wrapper around ``_add_session`` (no hint)."""
+        return await self._add_session(ws, remote)
 
     async def _detach_client(self, ws: Any, remote: str) -> None:
-        self._clients.discard(ws)
-        if self._ws is not ws:
-            logger.info("OneBot11 reverse WS stale client closed: %s", remote)
-            return
-        self._ws = next(iter(self._clients), None)
-        if self._ws is not None:
-            logger.info("OneBot11 reverse WS primary switched after %s", remote)
-            return
-        if self._probe_task is not None and not self._probe_task.done():
-            self._probe_task.cancel()
-        self._probe_task = None
-        self._connected_transport = False
-        self._login_confirmed = False
-        self._fail_pending(ConnectionError("OneBot 11 reverse socket closed"))
-        if not self._stopping:
-            self._runtime_error = "连接已断开，等待 NapCat 重连"
-        logger.info("OneBot11 reverse WS client disconnected: %s", remote)
+        """Backward-compatible wrapper: remove the session owning ``ws``."""
+        for session in list(self._sessions.values()):
+            if session.ws is ws:
+                await self._remove_session(session, reason="peer closed")
+                return
+        logger.info("OneBot11 reverse WS stale client closed: %s", remote)
 
     def _reverse_authorized(self, ws: Any, target: str) -> bool:
         token = str(self._config.token or "").strip()
@@ -800,7 +1477,8 @@ class OneBot11Channel(BaseChannel):
     # Receive path
     # ------------------------------------------------------------------
 
-    async def _receiver(self, ws: Any) -> None:
+    async def _receiver(self, session: _ConnSession) -> None:
+        ws = session.ws
         try:
             async for raw in ws:
                 if isinstance(raw, (bytes, bytearray)):
@@ -811,7 +1489,7 @@ class OneBot11Channel(BaseChannel):
                     logger.debug("OneBot11 ignored non-JSON frame: %.200r", raw)
                     continue
                 if isinstance(payload, dict):
-                    await self._dispatch_payload(payload)
+                    await self._dispatch_payload(payload, session)
         except asyncio.CancelledError:
             raise
         except ConnectionClosed:
@@ -820,48 +1498,75 @@ class OneBot11Channel(BaseChannel):
             self._runtime_error = f"receive_failed: {exc}"
             logger.exception("OneBot11 receive loop failed")
 
-    async def _dispatch_payload(self, payload: dict[str, Any]) -> None:
+    async def _dispatch_payload(
+        self,
+        payload: dict[str, Any],
+        session: _ConnSession | None = None,
+    ) -> None:
         echo = payload.get("echo")
         if echo is not None:
-            key = str(echo)
-            future = self._pending.pop(key, None)
-            if future is not None and not future.done():
-                future.set_result(payload)
+            owner = session if session is not None else self._primary_session()
+            pending = owner.pending if owner is not None else None
+            if pending is not None:
+                future = pending.pop(str(echo), None)
+                if future is not None and not future.done():
+                    future.set_result(payload)
             return
 
         post_type = payload.get("post_type")
         if post_type == "meta_event":
-            self._handle_meta_event(payload)
+            self._handle_meta_event(payload, session)
             return
         if post_type == "message":
-            self._handle_message_event(payload)
+            await self._handle_message_event(payload, session)
             return
         if post_type in ("notice", "request"):
-            logger.debug("OneBot11 %s event: %s", post_type, payload.get("notice_type") or payload.get("request_type"))
+            await self._handle_notice_event(payload, session)
             return
         logger.debug("OneBot11 unhandled event: %s", post_type)
 
-    def _handle_meta_event(self, payload: dict[str, Any]) -> None:
+    def _handle_meta_event(
+        self,
+        payload: dict[str, Any],
+        session: _ConnSession | None = None,
+    ) -> None:
         meta_type = payload.get("meta_event_type")
         self_id = payload.get("self_id")
-        if self_id and not self._self_id:
-            self._self_id = str(self_id)
+        target = session if session is not None else self._primary_session()
+        if self_id:
+            if target is not None:
+                self._register_session_identity(target, self_id)
+            elif not self._self_id:
+                self._self_id = str(self_id)
         if meta_type == "heartbeat":
             status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
             online = status.get("online")
-            if online is True and self._self_id:
-                self._login_confirmed = True
+            if online is True and (self._self_id or (target and target.self_id)):
+                if target is not None:
+                    target.login_confirmed = True
+                    self._refresh_state()
+                else:
+                    self._login_confirmed = True
                 self._runtime_error = None
             elif online is False:
-                self._login_confirmed = False
-                self._self_id = ""
+                if target is not None:
+                    target.login_confirmed = False
+                    target.self_id = ""
+                    self._refresh_state()
+                else:
+                    self._login_confirmed = False
+                    self._self_id = ""
                 self._runtime_error = "NapCat 未登录，等待登录"
         elif meta_type == "lifecycle":
             sub_type = payload.get("sub_type")
             if sub_type in ("connect", "enable"):
                 self._runtime_error = None if self._login_confirmed else "等待 NapCat 就绪"
 
-    def _handle_message_event(self, payload: dict[str, Any]) -> None:
+    async def _handle_message_event(
+        self,
+        payload: dict[str, Any],
+        session: _ConnSession | None = None,
+    ) -> None:
         message_type = payload.get("message_type")
         if message_type not in ("private", "group"):
             return
@@ -875,9 +1580,17 @@ class OneBot11Channel(BaseChannel):
 
         user_id = str(payload.get("user_id") or "")
         self_id = str(payload.get("self_id") or self._self_id or "")
-        if self_id and not self._self_id:
+        target = session if session is not None else self._primary_session()
+        if self_id and target is not None:
+            self._register_session_identity(target, self_id)
+        elif self_id and not self._self_id:
             self._self_id = self_id
         if self._config.ignore_self_message and self_id and user_id == self_id:
+            return
+        # Inbound sender policy: blacklist wins over the whitelist.
+        if self._blocked_senders and user_id in self._blocked_senders:
+            return
+        if self._allowed_senders and user_id not in self._allowed_senders:
             return
 
         message_id = str(payload.get("message_id") or "")
@@ -889,21 +1602,172 @@ class OneBot11Channel(BaseChannel):
             while len(self._dedupe) > _MAX_DEDUPE:
                 self._dedupe.popitem(last=False)
 
+        if self._config.resolve_forward and self._has_forward_segment(payload):
+            await self._resolve_forward_payload(payload)
+        if (
+            self._config.monitor_enabled
+            and message_type == "group"
+            and self._config.group_reply_mode == "mention"
+            and not self._event_triggers(payload)
+        ):
+            sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+            self._monitor_record(
+                str(payload.get("group_id") or ""),
+                user_id,
+                str(sender.get("card") or sender.get("nickname") or user_id),
+                self._raw_text(payload),
+            )
         self._runtime_error = None if self._self_id else self._runtime_error
         if self._self_id:
             self._login_confirmed = True
         self.enqueue(payload)
 
-    async def _login_probe_loop(self, ws: Any) -> None:
+    def _has_forward_segment(self, payload: dict[str, Any]) -> bool:
+        message = payload.get("message")
+        segments = message if isinstance(message, list) else []
+        return any(isinstance(seg, dict) and seg.get("type") == "forward" for seg in segments)
+
+    async def _resolve_forward_payload(self, payload: dict[str, Any]) -> None:
+        """Fetch merged-forward content and attach it for parse_inbound."""
+        message = payload.get("message")
+        segments = message if isinstance(message, list) else []
+        for seg in segments:
+            if not (isinstance(seg, dict) and seg.get("type") == "forward"):
+                continue
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            forward_id = str(data.get("id") or "")
+            if not forward_id:
+                continue
+            try:
+                resolved = await self._call_api("get_forward_msg", {"id": forward_id}, timeout=10.0)
+            except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+                logger.warning("OneBot11 forward resolve failed (id=%s): %s", forward_id, exc)
+                return
+            if isinstance(resolved, list):
+                payload["_forward_messages"] = resolved
+            return
+
+    def _event_triggers(self, payload: dict[str, Any]) -> bool:
+        """Cheap trigger check used by the monitor buffer (no full parse)."""
+        message = payload.get("message")
+        if isinstance(message, str):
+            segments = self._parse_cq_string(message)
+        elif isinstance(message, list):
+            segments = [seg for seg in message if isinstance(seg, dict)]
+        else:
+            segments = []
+        for seg in segments:
+            if seg.get("type") == "at":
+                data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                qq = str(data.get("qq") or "")
+                if self._self_id and qq == self._self_id:
+                    return True
+        return self._keyword_hit(self._raw_text(payload)) is not None
+
+    async def _handle_notice_event(
+        self,
+        payload: dict[str, Any],
+        session: _ConnSession | None = None,
+    ) -> None:
+        """Best-effort handling of notice / request events."""
+        try:
+            self_id = str(payload.get("self_id") or "")
+            target = session if session is not None else self._primary_session()
+            if self_id and target is not None:
+                self._register_session_identity(target, self_id)
+            elif self_id and not self._self_id:
+                self._self_id = self_id
+            if payload.get("post_type") == "request":
+                await self._handle_request_event(payload)
+                return
+            notice_type = str(payload.get("notice_type") or "")
+            sub_type = str(payload.get("sub_type") or "")
+            if notice_type == "notify" and sub_type == "poke":
+                target = str(payload.get("target_id") or "")
+                if target and target == self._self_id and self._config.poke_triggers_reply:
+                    self._enqueue_poke(payload)
+                else:
+                    logger.debug("OneBot11 poke not directed at bot: target=%s", target)
+            elif notice_type in ("friend_recall", "group_recall"):
+                logger.info(
+                    "OneBot11 message recalled: %s message_id=%s",
+                    notice_type,
+                    payload.get("message_id"),
+                )
+            elif notice_type == "group_increase" and str(payload.get("user_id") or "") == self._self_id:
+                logger.info("OneBot11 bot joined group %s", payload.get("group_id"))
+            else:
+                logger.debug(
+                    "OneBot11 %s event: %s/%s",
+                    payload.get("post_type"),
+                    notice_type,
+                    sub_type,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never kill the receiver loop
+            logger.warning("OneBot11 notice handling failed: %s", exc)
+
+    async def _handle_request_event(self, payload: dict[str, Any]) -> None:
+        request_type = str(payload.get("request_type") or "")
+        flag = str(payload.get("flag") or "")
+        if request_type == "friend" and self._config.auto_accept_friend_request and flag:
+            await self._call_api("set_friend_add_request", {"flag": flag, "approve": True})
+            logger.info("OneBot11 auto-accepted friend request (flag=%s)", flag)
+        elif request_type == "group" and self._config.auto_accept_group_invite and flag:
+            sub_type = str(payload.get("sub_type") or "invite")
+            await self._call_api(
+                "set_group_add_request",
+                {"flag": flag, "sub_type": sub_type, "approve": True},
+            )
+            logger.info("OneBot11 auto-accepted group request (flag=%s)", flag)
+        else:
+            logger.info("OneBot11 request event: %s flag=%s", request_type, flag)
+
+    def _enqueue_poke(self, payload: dict[str, Any]) -> None:
+        """Turn a poke-at-bot notice into a triggering synthetic message."""
+        user_id = str(payload.get("user_id") or "")
+        if not user_id or user_id == self._self_id:
+            return
+        group_id = str(payload.get("group_id") or "")
+        if group_id:
+            if self._config.group_reply_mode == "off":
+                return
+            message_type = "group"
+        else:
+            if self._config.private_reply_mode == "off":
+                return
+            message_type = "private"
+        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+        event: dict[str, Any] = {
+            "post_type": "message",
+            "message_type": message_type,
+            "sub_type": "poke",
+            "message_id": f"poke-{uuid.uuid4().hex}",
+            "user_id": int(user_id) if user_id.isdigit() else user_id,
+            "self_id": self._self_id or payload.get("self_id") or 0,
+            "time": int(time.time()),
+            "message": [{"type": "text", "data": {"text": "（戳了戳机器人）"}}],
+            "raw_message": "",
+            "sender": {"user_id": user_id, "nickname": str(sender.get("nickname") or "群友")},
+            "_octop_poke": True,
+        }
+        if group_id:
+            event["group_id"] = int(group_id) if group_id.isdigit() else group_id
+        self.enqueue(event)
+        logger.info("OneBot11 poke trigger enqueued (%s)", message_type)
+
+    async def _login_probe_loop(self, session: _ConnSession) -> None:
         """Detect NapCat login state; do not require it for channel startup."""
-        while not self._stopping and self._ws is ws:
-            if not self._login_confirmed:
+        while not self._stopping and session.key in self._sessions:
+            if not session.login_confirmed:
                 try:
-                    info = await self._call_api("get_login_info", {}, timeout=5.0)
+                    info = await self._api_via_session(session, "get_login_info", {}, timeout=5.0)
                     uid = str((info or {}).get("user_id") or "")
                     if uid and uid != "0":
-                        self._self_id = uid
-                        self._login_confirmed = True
+                        session.login_confirmed = True
+                        self._register_session_identity(session, uid)
+                        self._refresh_state()
                         self._runtime_error = None
                         logger.info("OneBot11 login detected: self_id=%s", uid)
                     else:
@@ -929,10 +1793,13 @@ class OneBot11Channel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def _send_text(self, subject: ChannelSubject, text: str) -> None:
-        if not self._connected_transport:
+        if not self._connected_transport and not self._http_available():
             logger.warning("OneBot11 text send skipped: WebSocket is not connected")
             return
         if not text.strip():
+            return
+        if (subject.metadata or {}).get("monitor") and text.strip() in _MONITOR_SKIP_TEXTS:
+            logger.info("OneBot11 monitor skip reply dropped")
             return
         segments: list[dict[str, Any]] = [{"type": "text", "data": {"text": chunk}} for chunk in self._split_text(text)]
         await self._send_segments(subject, segments, allow_quote=True)
@@ -990,20 +1857,31 @@ class OneBot11Channel(BaseChannel):
     ) -> None:
         if not segments:
             return
+        denial = self._send_denial(subject)
+        if denial:
+            # Passive replies to whitelisted-out targets are dropped silently:
+            # the agent already produced its answer, raising here has no reader.
+            logger.warning("OneBot11 passive send blocked by policy: %s", denial)
+            return
         action, params = self._build_send_action(subject, segments)
+        account = str((subject.metadata or {}).get("self_id") or "").strip()
+        if account and self._select_session(account) is None:
+            # The inbound account's session is gone; fall back to the primary
+            # connection (single-account legacy behaviour).
+            account = ""
         quote_id = str(subject.metadata.get("message_id") or "") if allow_quote else ""
         if self._config.reply_with_quote and quote_id:
             quoted = [{"type": "reply", "data": {"id": quote_id}}, *segments]
             try:
-                await self._call_api(action, {**params, "message": quoted})
+                await self._call_api(action, {**params, "message": quoted}, account=account)
                 return
             except OneBotAPIError as exc:
                 logger.info("OneBot11 quote reply failed, retrying without quote: %s", exc)
         try:
-            await self._call_api(action, {**params, "message": segments})
+            await self._call_api(action, {**params, "message": segments}, account=account)
         except OneBotAPIError as exc:
             logger.warning("OneBot11 send failed: %s", exc)
-        except (ConnectionClosed, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+        except (ConnectionError, ConnectionClosed, OSError, TimeoutError, asyncio.TimeoutError) as exc:
             logger.warning("OneBot11 send skipped, socket unavailable: %s", exc)
 
     def _build_send_action(
@@ -1036,24 +1914,50 @@ class OneBot11Channel(BaseChannel):
             user_id = subject_id[5:] if subject_id.startswith("user:") else subject_id
         return "send_private_msg", {"user_id": self._normalize_id(user_id)}
 
-    async def _call_api(self, action: str, params: dict[str, Any], *, timeout: float | None = None) -> Any:
-        ws = self._ws
-        if ws is None or not self._connected_transport:
+    async def _call_api(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        account: str = "",
+    ) -> Any:
+        """Send an action over the account's session (or the HTTP fallback)."""
+        account = str(account or "").strip()
+        session = self._select_session(account)
+        if account and session is None:
+            raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
+        if session is None:
+            if self._http_available():
+                return await self._call_api_http(action, params, timeout)
             raise ConnectionError("OneBot 11 WebSocket is not connected")
+        return await self._api_via_session(session, action, params, timeout)
+
+    async def _api_via_session(
+        self,
+        session: _ConnSession,
+        action: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        if session.key not in self._sessions:
+            raise ConnectionError("OneBot 11 connection is closed")
         echo = f"octop-{uuid.uuid4().hex}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[echo] = future
+        session.pending[echo] = future
         try:
-            await ws.send(json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False))
+            await session.ws.send(
+                json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
+            )
             response = await asyncio.wait_for(
                 future,
                 timeout=float(timeout or self._config.request_timeout_seconds),
             )
         except (TimeoutError, asyncio.TimeoutError):
-            self._pending.pop(echo, None)
+            session.pending.pop(echo, None)
             raise TimeoutError(f"OneBot action timed out: {action}") from None
         except Exception:
-            self._pending.pop(echo, None)
+            session.pending.pop(echo, None)
             raise
 
         status = str(response.get("status") or "")
@@ -1063,11 +1967,41 @@ class OneBot11Channel(BaseChannel):
             raise OneBotAPIError(action, retcode, message)
         return response.get("data")
 
-    def _fail_pending(self, exc: BaseException) -> None:
-        for future in self._pending.values():
-            if not future.done():
-                future.set_exception(exc)
-        self._pending.clear()
+    async def _call_api_http(
+        self,
+        action: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        """OneBot 11 HTTP API fallback (``POST {http_api_url}/{action}``)."""
+        base = str(self._config.http_api_url or "").strip().rstrip("/")
+        token = str(self._config.http_api_token or "").strip() or str(self._config.token or "").strip()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        body = json.dumps(params, ensure_ascii=False).encode("utf-8")
+        url = f"{base}/{action}"
+
+        def _post() -> dict[str, Any]:
+            request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(  # noqa: S310 - operator-configured endpoint
+                request,
+                timeout=float(timeout or self._config.http_api_timeout_seconds),
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            response = await asyncio.to_thread(_post)
+        except (urllib.error.URLError, OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
+            raise ConnectionError(
+                f"OneBot HTTP API unavailable: {exc.__class__.__name__}: {exc}"
+            ) from exc
+        status = str(response.get("status") or "")
+        retcode = response.get("retcode", 0)
+        if status == "failed" or retcode not in (0, None, "0"):
+            message = str(response.get("wording") or response.get("message") or "unknown error")
+            raise OneBotAPIError(action, retcode, message)
+        return response.get("data")
 
     def _split_text(self, text: str) -> list[str]:
         limit = max(200, int(self._config.max_text_chars))
@@ -1103,16 +2037,37 @@ class OneBot11Channel(BaseChannel):
         sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
         sender_name = str(sender.get("card") or sender.get("nickname") or user_id)
 
-        content, bot_mentioned, reply_to = self._parse_message_content(event.get("message"), self_id)
+        content, bot_mentioned, reply_to, mentions = self._parse_message_content(event.get("message"), self_id)
         keyword_triggered = False
         trigger_reason = "at" if bot_mentioned else ""
-        if not bot_mentioned and self._keywords:
+        if event.get("_octop_monitor") or event.get("_octop_poke"):
+            bot_mentioned = True
+            trigger_reason = "monitor" if event.get("_octop_monitor") else "poke"
+        elif not bot_mentioned and self._keywords:
             plain = "\n".join(part.text for part in content if isinstance(part, TextContent) and part.text)
             hit = self._keyword_hit(plain)
             if hit:
                 bot_mentioned = True
                 keyword_triggered = True
                 trigger_reason = f"keyword:{hit}"
+        forward_msgs = event.get("_forward_messages")
+        if isinstance(forward_msgs, list) and forward_msgs:
+            lines = []
+            for item in forward_msgs:
+                if not isinstance(item, dict):
+                    continue
+                fwd_sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+                name = str(fwd_sender.get("card") or fwd_sender.get("nickname") or fwd_sender.get("user_id") or "?")
+                segs = item.get("message") if isinstance(item.get("message"), list) else []
+                fwd_text = "".join(
+                    str((seg.get("data") or {}).get("text") or "")
+                    for seg in segs
+                    if isinstance(seg, dict) and seg.get("type") == "text"
+                )
+                if fwd_text:
+                    lines.append(f"{name}: {fwd_text[:120]}")
+            if lines:
+                content.append(TextContent(text="[合并转发]\n" + "\n".join(lines[:20])))
         if not content:
             content = [TextContent(text="")]
 
@@ -1133,6 +2088,9 @@ class OneBot11Channel(BaseChannel):
             "keyword_triggered": keyword_triggered,
             "trigger_reason": trigger_reason,
             "reply_to": reply_to,
+            "mentions": mentions,
+            "monitor": bool(event.get("_octop_monitor")),
+            "poke": bool(event.get("_octop_poke")),
             "raw_message": str(event.get("raw_message") or ""),
         }
         timestamp = event.get("time")
@@ -1163,10 +2121,11 @@ class OneBot11Channel(BaseChannel):
         self,
         message: Any,
         self_id: str,
-    ) -> tuple[list[ContentPart], bool, str]:
+    ) -> tuple[list[ContentPart], bool, str, list[dict[str, str]]]:
         parts: list[ContentPart] = []
         bot_mentioned = False
         reply_to = ""
+        mentions: list[dict[str, str]] = []
 
         segments: list[dict[str, Any]]
         if isinstance(message, str):
@@ -1190,6 +2149,7 @@ class OneBot11Channel(BaseChannel):
                 else:
                     name = str(data.get("name") or qq)
                     parts.append(TextContent(text=f"@{name} "))
+                    mentions.append({"qq": qq, "name": name})
             elif seg_type == "reply":
                 reply_to = str(data.get("id") or "")
             elif seg_type == "image":
@@ -1224,7 +2184,7 @@ class OneBot11Channel(BaseChannel):
             else:
                 logger.debug("OneBot11 unsupported segment type: %s", seg_type)
 
-        return parts, bot_mentioned, reply_to
+        return parts, bot_mentioned, reply_to, mentions
 
     def _image_part(self, data: dict[str, Any]) -> ContentPart:
         url = self._http_url(data)
@@ -1273,6 +2233,11 @@ class OneBot11Channel(BaseChannel):
     def _normalize_id(value: Any) -> Any:
         text = str(value or "").strip()
         return int(text) if text.isdigit() else text
+
+
+# QQ penguin icon (same asset the built-in "qq" channel kind uses in the
+# dashboard): an inline SVG data URI, rendered by the dashboard as <img src>.
+_QQ_ICON = "data:image/svg+xml,%3c?xml%20version='1.0'%20standalone='no'?%3e%3c!DOCTYPE%20svg%20PUBLIC%20'-//W3C//DTD%20SVG%201.1//EN'%20'http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd'%3e%3csvg%20t='1772609702986'%20class='icon'%20viewBox='0%200%201024%201024'%20version='1.1'%20xmlns='http://www.w3.org/2000/svg'%20p-id='5150'%20xmlns:xlink='http://www.w3.org/1999/xlink'%20width='64'%20height='64'%3e%3cpath%20d='M511.09761%20957.257c-80.159%200-153.737-25.019-201.11-62.386-24.057%206.702-54.831%2017.489-74.252%2030.864-16.617%2011.439-14.546%2023.106-11.55%2027.816%2013.15%2020.689%20225.583%2013.211%20286.912%206.767v-3.061z'%20fill='%23FAAD08'%20p-id='5151'%3e%3c/path%3e%3cpath%20d='M496.65061%20957.257c80.157%200%20153.737-25.019%20201.11-62.386%2024.057%206.702%2054.83%2017.489%2074.253%2030.864%2016.616%2011.439%2014.543%2023.106%2011.55%2027.816-13.15%2020.689-225.584%2013.211-286.914%206.767v-3.061z'%20fill='%23FAAD08'%20p-id='5152'%3e%3c/path%3e%3cpath%20d='M497.12861%20474.524c131.934-0.876%20237.669-25.783%20273.497-35.34%208.541-2.28%2013.11-6.364%2013.11-6.364%200.03-1.172%200.542-20.952%200.542-31.155C784.27761%20229.833%20701.12561%2057.173%20496.64061%2057.162%20292.15661%2057.173%20209.00061%20229.832%20209.00061%20401.665c0%2010.203%200.516%2029.983%200.547%2031.155%200%200%203.717%203.821%2010.529%205.67%2033.078%208.98%20140.803%2035.139%20276.08%2036.034h0.972z'%20fill='%23000000'%20p-id='5153'%3e%3c/path%3e%3cpath%20d='M860.28261%20619.782c-8.12-26.086-19.204-56.506-30.427-85.72%200%200-6.456-0.795-9.718%200.148-100.71%2029.205-222.773%2047.818-315.792%2046.695h-0.962C410.88561%20582.017%20289.65061%20563.617%20189.27961%20534.698%20185.44461%20533.595%20177.87261%20534.063%20177.87261%20534.063%20166.64961%20563.276%20155.56661%20593.696%20147.44761%20619.782%20108.72961%20744.168%20121.27261%20795.644%20130.82461%20796.798c20.496%202.474%2079.78-93.637%2079.78-93.637%200%2097.66%2088.324%20247.617%20290.576%20248.996a718.01%20718.01%200%200%201%205.367%200C708.80161%20950.778%20797.12261%20800.822%20797.12261%20703.162c0%200%2059.284%2096.111%2079.783%2093.637%209.55-1.154%2022.093-52.63-16.623-177.017'%20fill='%23000000'%20p-id='5154'%3e%3c/path%3e%3cpath%20d='M434.38261%20316.917c-27.9%201.24-51.745-30.106-53.24-69.956-1.518-39.877%2019.858-73.207%2047.764-74.454%2027.875-1.224%2051.703%2030.109%2053.218%2069.974%201.527%2039.877-19.853%2073.2-47.742%2074.436m206.67-69.956c-1.494%2039.85-25.34%2071.194-53.24%2069.956-27.888-1.238-49.269-34.559-47.742-74.435%201.513-39.868%2025.341-71.201%2053.216-69.974%2027.909%201.247%2049.285%2034.576%2047.767%2074.453'%20fill='%23FFFFFF'%20p-id='5155'%3e%3c/path%3e%3cpath%20d='M683.94261%20368.627c-7.323-17.609-81.062-37.227-172.353-37.227h-0.98c-91.29%200-165.031%2019.618-172.352%2037.227a6.244%206.244%200%200%200-0.535%202.505c0%201.269%200.393%202.414%201.006%203.386%206.168%209.765%2088.054%2058.018%20171.882%2058.018h0.98c83.827%200%20165.71-48.25%20171.881-58.016a6.352%206.352%200%200%200%201.002-3.395c0-0.897-0.2-1.736-0.531-2.498'%20fill='%23FAAD08'%20p-id='5156'%3e%3c/path%3e%3cpath%20d='M467.63161%20256.377c1.26%2015.886-7.377%2030-19.266%2031.542-11.907%201.544-22.569-10.083-23.836-25.978-1.243-15.895%207.381-30.008%2019.25-31.538%2011.927-1.549%2022.607%2010.088%2023.852%2025.974m73.097%207.935c2.533-4.118%2019.827-25.77%2055.62-17.886%209.401%202.07%2013.75%205.116%2014.668%206.316%201.355%201.77%201.726%204.29%200.352%207.684-2.722%206.725-8.338%206.542-11.454%205.226-2.01-0.85-26.94-15.889-49.905%206.553-1.579%201.545-4.405%202.074-7.085%200.242-2.678-1.834-3.786-5.553-2.196-8.135'%20fill='%23000000'%20p-id='5157'%3e%3c/path%3e%3cpath%20d='M504.33261%20584.495h-0.967c-63.568%200.752-140.646-7.504-215.286-21.92-6.391%2036.262-10.25%2081.838-6.936%20136.196%208.37%20137.384%2091.62%20223.736%20220.118%20224.996H506.48461c128.498-1.26%20211.748-87.612%20220.12-224.996%203.314-54.362-0.547-99.938-6.94-136.203-74.654%2014.423-151.745%2022.684-215.332%2021.927'%20fill='%23FFFFFF'%20p-id='5158'%3e%3c/path%3e%3cpath%20d='M323.27461%20577.016v137.468s64.957%2012.705%20130.031%203.91V591.59c-41.225-2.262-85.688-7.304-130.031-14.574'%20fill='%23EB1C26'%20p-id='5159'%3e%3c/path%3e%3cpath%20d='M788.09761%20432.536s-121.98%2040.387-283.743%2041.539h-0.962c-161.497-1.147-283.328-41.401-283.744-41.539l-40.854%20106.952c102.186%2032.31%20228.837%2053.135%20324.598%2051.926l0.96-0.002c95.768%201.216%20222.4-19.61%20324.6-51.924l-40.855-106.952z'%20fill='%23EB1C26'%20p-id='5160'%3e%3c/path%3e%3c/svg%3e"
 
 
 # ----------------------------------------------------------------------
@@ -1390,6 +2355,86 @@ _FIELDS: list[dict[str, Any]] = [
         "required": False,
         "helpKey": "onebot11.replyWithQuote",
     },
+    {
+        "name": "allowed_groups",
+        "label": "群白名单",
+        "type": "text",
+        "placeholder": "逗号分隔群号，留空不限制，例如：123456789,987654321",
+        "required": False,
+        "helpKey": "onebot11.allowedGroups",
+    },
+    {
+        "name": "allowed_users",
+        "label": "私聊白名单",
+        "type": "text",
+        "placeholder": "逗号分隔 QQ 号，留空不限制",
+        "required": False,
+        "helpKey": "onebot11.allowedUsers",
+    },
+    {
+        "name": "outbox_enabled",
+        "label": "断线排队发送",
+        "type": "switch",
+        "placeholder": "true",
+        "required": False,
+        "helpKey": "onebot11.outboxEnabled",
+    },
+    {
+        "name": "allowed_senders",
+        "label": "发送人白名单",
+        "type": "text",
+        "placeholder": "逗号分隔 QQ 号，留空不限制（入站）",
+        "required": False,
+        "helpKey": "onebot11.allowedSenders",
+    },
+    {
+        "name": "blocked_senders",
+        "label": "发送人黑名单",
+        "type": "text",
+        "placeholder": "逗号分隔 QQ 号，优先于白名单",
+        "required": False,
+        "helpKey": "onebot11.blockedSenders",
+    },
+    {
+        "name": "poke_triggers_reply",
+        "label": "戳一戳触发回复",
+        "type": "switch",
+        "placeholder": "false",
+        "required": False,
+        "helpKey": "onebot11.pokeTriggersReply",
+    },
+    {
+        "name": "auto_accept_friend_request",
+        "label": "自动通过好友请求",
+        "type": "switch",
+        "placeholder": "false",
+        "required": False,
+        "helpKey": "onebot11.autoAcceptFriendRequest",
+    },
+    {
+        "name": "auto_accept_group_invite",
+        "label": "自动通过群邀请",
+        "type": "switch",
+        "placeholder": "false",
+        "required": False,
+        "helpKey": "onebot11.autoAcceptGroupInvite",
+    },
+    {
+        "name": "monitor_enabled",
+        "label": "群巡检",
+        "type": "switch",
+        "placeholder": "false",
+        "required": False,
+        "helpKey": "onebot11.monitorEnabled",
+    },
+    {
+        "name": "multi_account",
+        "label": "多账号（反向）",
+        "type": "switch",
+        "placeholder": "false",
+        "required": False,
+        "helpKey": "onebot11.multiAccount",
+    },
 ]
 
 
@@ -1399,6 +2444,7 @@ def setup(ctx: Any) -> None:
         "onebot11",
         OneBot11Channel,
         label="OneBot 11 (NapCat)",
+        icon=_QQ_ICON,
         intro_url="https://napcat.napneko.icu/",
         fields=_FIELDS,
     )

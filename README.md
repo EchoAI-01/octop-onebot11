@@ -4,9 +4,9 @@
 
 **把个人 QQ 接入 Octop 的 OneBot 11 / NapCat 通道插件**
 
-正向 / 反向 WebSocket · 群聊触发门控 · 主动发送 · 单文件、无额外依赖
+正向 / 反向 WebSocket · 群聊触发门控 · 主动发送 · 断线排队补发 · 单文件、无额外依赖
 
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Octop](https://img.shields.io/badge/Octop-channel%20plugin-6f42c1.svg)](https://github.com/TencentCloud/Octop)
@@ -26,7 +26,14 @@ Octop 官方的 QQ 通道依赖 QQ 开放平台机器人（AppID + Token），�
 - **两种传输方向**：`forward`（Octop 主动连 NapCat）与 `reverse`（NapCat 主动连 Octop），共用同一套协议与路由代码。
 - **群聊触发门控**：默认只响应 `@` 或关键词，非触发消息只进群上下文缓存，不调用 LLM，避免“一直监听 = 一直烧 Token”。
 - **私聊策略**：`always` / `keyword` / `off` 三档。
-- **主动发送**：附带 `onebot11_send_group` / `onebot11_send_private` 工具，可向任意群/用户发消息，不要求该会话已存在。
+- **主动发送**：附带 `onebot11_send_group` / `onebot11_send_private` / `onebot11_send_forward_group` 工具，可向任意群/用户发消息（支持图片、@ 成员、引用、合并转发），不要求该会话已存在。
+- **断线排队补发**：主动发送遇到 NapCat 断线时进入待发队列（outbox），重连后按序自动补发；失败按退避重试，过期/超限自动丢弃；**队列落盘持久化，Octop 重启后继续补发**。
+- **多账号（反向）**：`multi_account` 开启后一条反向通道可同时接入多个 QQ，按 `self_id` 路由收发；工具用 `account` 参数指定发送账号。
+- **HTTP 备用通道**：配置 `http_api_url` 后，WebSocket 断开期间出站 action 自动改走 OneBot HTTP API（覆盖主动发送、被动回复与 outbox 补发）。
+- **事件处理**：好友请求 / 群邀请可配置自动通过；戳一戳可触发回复；撤回、入群等 notice 事件记日志。
+- **发送人白名单 / 黑名单**：入站按发送者 QQ 号过滤（`allowed_senders` / `blocked_senders`），黑名单优先。
+- **群巡检**：`monitor_enabled` 周期汇总未触发回复的群消息并唤醒 Agent 判断是否需要回应；间隔与每小时上限双重节流，Agent 回复「〔巡检跳过〕」即静默跳过。
+- **出站白名单**：`allowed_groups` / `allowed_users` 限制可发送的群/用户，防止 Agent 误发；发送限速可配置。
 - **定时任务零 Token**：配合 Octop cron 的 `task_type=text`，直接走通道发送，不启动 Agent。
 - **富媒体发送**：图片、视频、语音、HTTP 文件，单文件上限 10 MB。
 - **弱依赖启动**：NapCat 未启动、QQ 未登录时通道照常注册，状态降级并持续重连，不阻塞 Octop 启动。
@@ -144,6 +151,16 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | `private_reply_mode` | select | `always` | `always` / `keyword` / `off` |
 | `group_history_limit` | number | `10` | 触发时携带的群上下文条数 |
 | `reply_with_quote` | switch | `false` | 回复时是否引用原消息 |
+| `allowed_groups` | text | 空 | 群白名单，逗号分隔群号；留空不限制 |
+| `allowed_users` | text | 空 | 私聊白名单，逗号分隔 QQ 号；留空不限制 |
+| `outbox_enabled` | switch | `true` | 断线时主动消息进入待发队列，重连后补发 |
+| `allowed_senders` | text | 空 | 发送人白名单（入站），逗号分隔 QQ 号；留空不限制 |
+| `blocked_senders` | text | 空 | 发送人黑名单（入站），优先于白名单 |
+| `poke_triggers_reply` | switch | `false` | 戳一戳机器人是否触发回复 |
+| `auto_accept_friend_request` | switch | `false` | 自动通过好友请求 |
+| `auto_accept_group_invite` | switch | `false` | 自动通过群邀请 |
+| `monitor_enabled` | switch | `false` | 群巡检（周期汇总未触发消息并唤醒 Agent） |
+| `multi_account` | switch | `false` | 反向模式允许多账号同时接入（按 self_id 路由） |
 
 ### 高级字段（仅 JSON / CLI）
 
@@ -157,6 +174,22 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | `request_timeout_seconds` | `15` | OneBot action 超时 |
 | `startup_wait_seconds` | `2` | 创建通道时等待首次连接的时间 |
 | `reconnect_min_seconds` / `reconnect_max_seconds` | `1` / `30` | 重连退避区间 |
+| `send_rate_limit_count` / `send_rate_limit_window` | `20` / `60` | 发送限速（条数 / 秒）；count=0 关闭限速 |
+| `outbox_max_items` | `100` | 待发队列容量上限，超出后新的主动消息直接失败 |
+| `outbox_ttl_seconds` | `3600` | 待发消息有效期，过期丢弃 |
+| `outbox_max_attempts` | `3` | 单条消息最大重试次数 |
+| `outbox_retry_min_seconds` / `outbox_retry_max_seconds` | `2` / `60` | 失败重试退避区间（指数） |
+| `outbox_persist` | `true` | 队列落盘（`outbox_persist_dir`，默认 `~/.octop/onebot11/state`），重启后继续补发 |
+| `outbox_persist_dir` | 空 | 持久化目录；空用默认 `~/.octop/onebot11/state` |
+| `http_api_url` | 空 | OneBot HTTP API 地址（如 `http://127.0.0.1:3000`）；WS 断开时出站走此通道 |
+| `http_api_token` | 空 | HTTP API Token；留空复用 `token` |
+| `http_api_timeout_seconds` | `10` | HTTP action 超时 |
+| `resolve_forward` | `false` | 入站合并转发是否调用 `get_forward_msg` 展开为文本 |
+| `monitor_interval_seconds` | `600` | 巡检周期（秒，最小 30） |
+| `monitor_min_messages` | `5` | 触发巡检所需的最少未响应消息数 |
+| `monitor_keywords` | 空 | 巡检关键词过滤，逗号分隔；留空不过滤 |
+| `monitor_min_trigger_gap_seconds` | `1800` | 同一群两次巡检触发的最小间隔 |
+| `monitor_max_per_hour` | `4` | 全局每小时巡检触发上限 |
 
 ## 触发与 Token 控制
 
@@ -184,10 +217,18 @@ Octop 核心没有“向任意群发消息”的 REST 接口，因此本仓库�
 ```python
 onebot11_send_group(group_id="123456789", text="构建完成，产物已上传")
 onebot11_send_private(user_id="10001", text="任务已结束")
+# 富媒体与 @：image_url 支持 http(s) URL 或 Octop 服务器本地文件路径（自动转 base64，上限 10 MB）
+onebot11_send_group(group_id="123456789", text="新版本截图", image_url="/tmp/build.png", at_user_id="10001")
+# 引用回复某条消息
+onebot11_send_group(group_id="123456789", text="针对这条的补充", reply_to_message_id="9001")
+# 合并转发：多条文本打包成一条转发卡片
+onebot11_send_forward_group(group_id="123456789", messages_json='[{"name": "早报", "text": "第一条"}, {"name": "早报", "text": "第二条"}]')
 ```
 
 - 不要求该群此前与机器人有过会话。
 - 发送失败会返回 `发送失败: ...`，不会静默丢弃。
+- NapCat 断线时：配置了 `http_api_url` 则自动改走 HTTP 发送；否则消息进入待发队列（`outbox_enabled`），重连后自动补发，返回值会注明排队状态；队列关闭或已满时仍返回 `发送失败`。
+- 目标群/用户不在 `allowed_groups` / `allowed_users` 白名单内时，主动发送返回 `发送失败`，被动回复静默丢弃并记日志。
 - `channel_id` 可选，留空时使用第一个已连接的 OneBot 通道。
 
 定时任务同理，`task_type="text"` 不启动 Agent：
@@ -279,11 +320,11 @@ python tools/test_plugin_e2e.py
 
 ## 限制
 
-- 没有离线队列：NapCat 断线时主动发送会立即失败，不会排队重试。
+- 待发队列持久化为**文件级**（enqueue/flush/stop 时落盘）：覆盖 NapCat 重启、网络抖动与 Octop 正常重启；进程崩溃可能丢失最后一批未落盘消息。去重缓存仍在内存（真实 NapCat 断线不会重推消息）。
+- HTTP 备用通道仅覆盖**出站**：登录态探测、入站事件仍依赖 WebSocket。
+- 多账号仅支持**反向模式**：每个账号一条连接，按 `self_id` 路由；主动发送指定未连接的 `account` 会直接报错（不排队）。
+- 群巡检每次触发都会唤醒一轮 Agent（消耗 Token）：节流参数就是为控制频次设计的；Agent 无需介入时回复「〔巡检跳过〕」会被通道静默吞掉，不会发到群里。
 - 没有投递回执：只保证 OneBot `retcode=0`，不返回 `message_id`，无法感知 QQ 侧吞消息。
-- 主动发送工具只支持文本，富媒体需要通过 Agent 回复路径发送。
-- 没有群白名单，任何可调用工具的 Agent 都能向任意群发送。
-- 反向模式单连接：同一通道只保留最新一条连接。
 
 ## 目录结构
 
@@ -297,7 +338,8 @@ octop-onebot11/
 │     ├─ plugin.yaml
 │     └─ main.py
 ├─ tools/                      # mock NapCat 与测试脚本
-├─ deploy/                     # Windows 一键部署脚本、NapCat 配置模板
+├─ scripts/                    # patch_channel.py：配置读-合并-写（防 patch 整体替换丢配置）
+├─ deploy/                     # install.sh 跨形态部署脚本、Windows 脚本、NapCat 模板
 ├─ docs/                       # 开发手记、设计说明、NapCat 配置
 └─ .github/workflows/ci.yml
 ```
@@ -312,11 +354,13 @@ octop-onebot11/
 
 开发环境搭建、代码地图、开发约定、常见任务与路线图见 [docs/development.md](docs/development.md)。
 
+部署：`deploy/install.sh` 支持 systemd 裸机与 Docker 两种形态（自动探测，`--host` 远程执行，详见脚本头部注释）；配置修改用 `scripts/patch_channel.py`（`octop channel patch` 是整体替换，该脚本做读-合并-写并保护被掩码的 token；提供 `--api-url/--api-token` 时走核心 HTTP PATCH，**配置热生效免重启**）。
+
 当前优先事项：
 
-1. 通道配置热更新接口（R1，详见开发文档第 9 节）
-2. 主动发送 outbox 与重试
-3. 群白名单与发送配额
+1. 配置热更新接口 R1 Phase 2/3（核心 `/config` GET/PATCH 增量接口，详见开发文档第 9 节；本仓库侧 Phase 1 脚本与热生效写入路径均已落地，剩余部分需向 Octop 核心提 PR）
+2. 指标与健康检查（可观测性）
+3. 配置向导 / 表单联动（依赖 Dashboard 能力）
 
 ## License
 

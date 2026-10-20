@@ -72,6 +72,9 @@ class BaseChannel:
         self._channel_id = channel_id or "test-channel"
         self._tenant_id = tenant_id
         self.enqueued = []
+        # Mirror the real BaseChannel: constraints are resolved during
+        # __init__, before subclass constructors assign their own attributes.
+        self._default_constraints()
 
     @property
     def channel_id(self):
@@ -200,19 +203,27 @@ def load_plugin():
     return module
 
 
-def start_mock(log_path: Path, *, logged_in: bool) -> subprocess.Popen:
+def start_mock(
+    log_path: Path,
+    *,
+    logged_in: bool,
+    port: int = PORT,
+    http_port: int = 0,
+) -> subprocess.Popen:
     args = [
         PY,
         str(ROOT / "tools" / "mock_napcat.py"),
         "--host",
         "127.0.0.1",
         "--port",
-        str(PORT),
+        str(port),
         "--token",
         "dev-token",
         "--log-file",
         str(log_path),
     ]
+    if http_port:
+        args += ["--http-port", str(http_port)]
     if logged_in:
         args += ["--logged-in", "--send-test-after", "4"]
     return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -261,11 +272,24 @@ async def scenario_logged_in(plugin, log_path: Path):
         )
         await channel.push_text(stale, "主动群消息2")
 
+        # Rich proactive push: @ + image + text segments in one message.
+        await channel.push_segments(
+            plugin.build_group_subject("20002"),
+            [
+                {"type": "at", "data": {"qq": "10001"}},
+                {"type": "image", "data": {"file": "https://example.com/a.png"}},
+                {"type": "text", "data": {"text": "富媒体主动消息"}},
+            ],
+        )
+
         await asyncio.sleep(0.8)
         log = log_path.read_text(encoding="utf-8")
         assert "send_group_msg target=20002" in log, log[-2000:]
         assert "收到，通道正常。" in log
         assert "主动群消息" in log
+        assert '"qq": "10001"' in log, log[-2000:]
+        assert "https://example.com/a.png" in log, log[-2000:]
+        assert "富媒体主动消息" in log, log[-2000:]
         assert "send_private_msg" not in log, log[-2000:]
 
         await channel.stop()
@@ -305,6 +329,85 @@ async def scenario_not_logged_in(plugin, log_path: Path):
             proc.kill()
 
 
+async def scenario_outbox(plugin, log_path: Path):
+    """Offline strict pushes park in the outbox and drain once NapCat appears."""
+    port = free_port()
+    cfg = plugin.OneBot11Config(
+        ws_url=f"ws://127.0.0.1:{port}",
+        token="dev-token",
+        group_reply_mode="mention",
+        reconnect_min_seconds=0.5,
+        reconnect_max_seconds=2.0,
+        startup_wait_seconds=0.5,
+        outbox_persist_dir=tempfile.mkdtemp(),
+    )
+    channel = plugin.OneBot11Channel(lambda _m: None, config=cfg, channel_id="e2e-outbox", tenant_id="Eous")
+    await channel.start()
+    await asyncio.sleep(0.5)
+    assert not channel.is_connected, "channel must start offline against a dead endpoint"
+
+    # Strict push while offline parks the message instead of raising.
+    await channel.push_text(plugin.build_group_subject("20002"), "排队后补发")
+    assert len(channel._outbox) == 1, "message must be queued while disconnected"
+
+    proc = start_mock(log_path, logged_in=True, port=port)
+    try:
+        assert await wait_connected(channel, timeout=15), f"not connected: {channel.runtime_error}"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and channel._outbox:
+            await asyncio.sleep(0.1)
+        assert not channel._outbox, f"outbox not drained: {channel.runtime_error}"
+        log = log_path.read_text(encoding="utf-8")
+        assert "send_group_msg target=20002" in log, log[-2000:]
+        assert "排队后补发" in log, log[-2000:]
+        await channel.stop()
+        print("outbox scenario passed")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+async def scenario_http_fallback(plugin, log_path: Path):
+    """Proactive sends go through the OneBot HTTP API while WS is down."""
+    ws_port = free_port()
+    http_port = free_port()
+    dead_ws = free_port()
+    proc = start_mock(log_path, logged_in=True, port=ws_port, http_port=http_port)
+    try:
+        await asyncio.sleep(0.8)
+        cfg = plugin.OneBot11Config(
+            ws_url=f"ws://127.0.0.1:{dead_ws}",  # nothing listens here
+            token="dev-token",
+            http_api_url=f"http://127.0.0.1:{http_port}",
+            group_reply_mode="mention",
+            reconnect_min_seconds=0.5,
+            reconnect_max_seconds=2.0,
+            startup_wait_seconds=0.5,
+        )
+        channel = plugin.OneBot11Channel(lambda _m: None, config=cfg, channel_id="e2e-http", tenant_id="Eous")
+        await channel.start()
+        await asyncio.sleep(0.5)
+        assert not channel.is_connected, "WS is dead; login cannot be confirmed"
+
+        await channel.push_text(plugin.build_group_subject("20002"), "HTTP 备用通道消息")
+        await asyncio.sleep(0.8)
+        assert not channel._outbox, "push must not queue when the HTTP fallback works"
+        log = log_path.read_text(encoding="utf-8")
+        assert "send_group_msg target=20002" in log, log[-2000:]
+        assert "HTTP 备用通道消息" in log, log[-2000:]
+        await channel.stop()
+        print("http-fallback scenario passed")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -314,8 +417,9 @@ def free_port() -> int:
 class ReverseNapCat:
     """Minimal NapCat reverse-WS client: answers actions, records requests."""
 
-    def __init__(self, ws):
+    def __init__(self, ws, user_id: int = 10000):
         self.ws = ws
+        self.user_id = user_id
         self.actions: list[dict] = []
         self._task: asyncio.Task | None = None
 
@@ -331,7 +435,7 @@ class ReverseNapCat:
             self.actions.append(payload)
             data = {}
             if payload.get("action") == "get_login_info":
-                data = {"user_id": 10000, "nickname": "反向测试机器人"}
+                data = {"user_id": self.user_id, "nickname": "反向测试机器人"}
             await self.ws.send(
                 json.dumps({"status": "ok", "retcode": 0, "data": data, "echo": echo})
             )
@@ -448,13 +552,104 @@ async def scenario_reverse(plugin):
     print("reverse scenario passed")
 
 
+async def scenario_reverse_multi(plugin):
+    """Two NapCat accounts coexist on one reverse channel (multi_account)."""
+    port = free_port()
+    cfg = plugin.OneBot11Config(
+        connection_mode="reverse",
+        listen_host="127.0.0.1",
+        listen_port=port,
+        listen_path="/onebot/v11/ws",
+        token="dev-token",
+        group_reply_mode="mention",
+        multi_account=True,
+    )
+    channel = plugin.OneBot11Channel(
+        lambda _m: None, config=cfg, channel_id="e2e-rev-multi", tenant_id="Eous"
+    )
+    await channel.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and channel._server is None:
+        await asyncio.sleep(0.05)
+    assert channel._server is not None, f"reverse listener not bound: {channel.runtime_error}"
+    url = f"ws://127.0.0.1:{port}/onebot/v11/ws"
+
+    async with websockets.connect(
+        url,
+        additional_headers={"Authorization": "Bearer dev-token", "X-Self-ID": "10000"},
+    ) as ws_a:
+        napcat_a = ReverseNapCat(ws_a, user_id=10000)
+        await napcat_a.start()
+        async with websockets.connect(
+            url,
+            additional_headers={"Authorization": "Bearer dev-token", "X-Self-ID": "20000"},
+        ) as ws_b:
+            napcat_b = ReverseNapCat(ws_b, user_id=20000)
+            await napcat_b.start()
+            try:
+                assert await wait_connected(channel), f"not connected: {channel.runtime_error}"
+                assert len(channel._sessions) == 2, "both accounts must coexist"
+
+                event = {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "message_id": 88002,
+                    "group_id": 30003,
+                    "user_id": 10001,
+                    "self_id": 20000,
+                    "message": [
+                        {"type": "at", "data": {"qq": "20000"}},
+                        {"type": "text", "data": {"text": " 账号B的群消息"}},
+                    ],
+                    "raw_message": "[CQ:at,qq=20000] 账号B的群消息",
+                    "sender": {"user_id": 10001, "nickname": "测试用户"},
+                }
+                await ws_b.send(json.dumps(event, ensure_ascii=False))
+
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline and not channel.enqueued:
+                    await asyncio.sleep(0.05)
+                assert channel.enqueued, "reverse multi inbound event not enqueued"
+                message = channel.parse_inbound(channel.enqueued[0])
+                assert message.channel_subject.subject_id == "group:30003"
+                assert message.metadata["self_id"] == "20000"
+
+                # Passive replies route back to the account that received them.
+                await channel._send_text(message.channel_subject, "回给账号B")
+                b_reply = await napcat_b.wait_action("send_group_msg")
+                assert b_reply["params"]["group_id"] == 30003
+
+                # Account-targeted push goes to B; the default goes to the primary (A).
+                await channel.push_text(
+                    plugin.build_group_subject("20002", self_id="20000"), "定向账号B"
+                )
+                targeted = await napcat_b.wait_action("send_group_msg", index=1)
+                assert targeted["params"]["group_id"] == 20002
+                await channel.push_text(plugin.build_group_subject("20002"), "默认账号A")
+                a_push = await napcat_a.wait_action("send_group_msg")
+                assert a_push["params"]["group_id"] == 20002
+            finally:
+                await napcat_b.close()
+
+    # Account A must stay healthy after B leaves.
+    assert channel.is_connected, "account A must stay connected after B leaves"
+    await napcat_a.close()
+    await channel.stop()
+    print("reverse multi-account scenario passed")
+
+
 async def main():
     plugin = load_plugin()
     with tempfile.TemporaryDirectory() as tmp:
         await scenario_not_logged_in(plugin, Path(tmp) / "mock-nologin.log")
     with tempfile.TemporaryDirectory() as tmp:
         await scenario_logged_in(plugin, Path(tmp) / "mock-login.log")
+    with tempfile.TemporaryDirectory() as tmp:
+        await scenario_outbox(plugin, Path(tmp) / "mock-outbox.log")
+    with tempfile.TemporaryDirectory() as tmp:
+        await scenario_http_fallback(plugin, Path(tmp) / "mock-http.log")
     await scenario_reverse(plugin)
+    await scenario_reverse_multi(plugin)
 
 
 if __name__ == "__main__":

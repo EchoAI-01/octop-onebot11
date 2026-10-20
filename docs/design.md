@@ -17,6 +17,7 @@ def setup(ctx):
         "onebot11",
         OneBot11Channel,
         label="OneBot 11 (NapCat)",
+        icon=_QQ_ICON,  # QQ 企鹅 SVG data URI，与内置 qq 通道同款（Dashboard 以 <img src> 渲染）
         intro_url="https://napcat.napneko.icu/",
         fields=_FIELDS,
     )
@@ -78,21 +79,25 @@ _run_forever()
 _serve_forever()
   └─ async with serve(_handle_reverse_client, host, port) as server
        ├─ _handle_reverse_client(ws)   # 路径校验 → token 校验 → 入站循环
-       │    ├─ _attach_client(ws)
-       │    │    ├─ _clients.add(ws); _ws = ws; _connected_transport = True
-       │    │    ├─ 启动 _login_probe_loop(ws)
-       │    │    └─ 关闭上一条连接（单连接语义）
-       │    └─ _detach_client(ws): 仅当 ws 仍是主连接时复位状态
+       │    ├─ _add_session(ws)        # 每条连接一个 _ConnSession
+       │    │    ├─ sessions[key] = {ws, self_id, login, probe, pending}
+       │    │    ├─ 启动 _login_probe_loop(session)
+       │    │    └─ multi_account=false：关闭全部旧连接（单连接语义）
+       │    │       multi_account=true ：不同 self_id 共存，同 self_id 顶旧
+       │    └─ _remove_session(session)：清探针/pending，_refresh_state() 重算聚合计
        └─ 监听循环（0.5s tick），端口占用时按退避重建
 ```
 
 细节：
 
+- **聚合计派生**：`_ws` / `_connected_transport` / `_login_confirmed` / `_self_id` 不再直接维护，由 `_refresh_state()` 从会话表派生（主会话 = `config.self_id` 匹配者或首条），单账号行为与旧版完全一致。
+- **账号路由**：出站 `_call_api(account=…)` 严格匹配会话 `self_id`；主动发送指定未连接账号直接报错，被动回复降级回主连接；outbox 条目携带 account，补发走原账号。
+- **outbox 持久化**：enqueue/flush/stop 时原子落盘 `{outbox_persist_dir}/{channel_id}.json`，构造时恢复（epoch↔monotonic 换算保留 TTL 年龄），Octop 重启后继续补发。
 - **服务端 API**：优先 `websockets.asyncio.server.serve`；旧版本回退到 `websockets.serve`。两者都支持 `async with`，生命周期一致。
 - **鉴权**：`Authorization: Bearer <token>` 或查询参数 `?access_token=<token>`，使用 `hmac.compare_digest` 比较；`token` 为空时接受任意连接并打印告警。
 - **路径**：默认只接受 `/onebot/v11/ws`，不匹配直接 1008 关闭；`listen_path="/"` 表示任意路径。
 - **`X-Self-ID`**：NapCat 的反向连接会带该头，插件只用来预填 `self_id`，不据此判定已登录。
-- **单连接**：同一通道同时只保留一条主连接。NapCat 重连时新连接顶掉旧连接，旧连接关闭时不会误清状态。
+- **单连接（默认）**：`multi_account=false` 时同一通道只保留最新一条连接。NapCat 重连时新连接顶掉旧连接，旧连接关闭时不会误清状态。`multi_account=true` 时多个 QQ 账号可同时接入（每账号一条连接，同账号重连仍顶旧）。
 - **探针端口**：`octop channel test` 会创建 `channel_id="__probe__"` 的临时实例；反向模式下自动改用端口 `0`，避免与线上监听冲突。
 
 ## 6. 触发门控
@@ -113,6 +118,8 @@ _serve_forever()
 | `off` | `false` | — |
 
 这样非触发消息既不进 Agent，又能在下一次触发时提供上下文。
+
+v0.4.0 在同一入口叠加了两层入站策略与巡检：`blocked_senders` / `allowed_senders` 在自查与去重之后过滤发送人（黑名单优先）；`monitor_enabled` 时，mention 模式下未触发的群消息额外进入插件自己的监控缓冲，`_monitor_sweep()` 按条数 / 关键词 / 间隔 / 每小时上限节流后合成一条摘要事件（`trigger_reason=monitor`）唤醒 Agent。摘要文本要求 Agent 无需介入时只回「〔巡检跳过〕」，出站时被 `_send_text()` 的哨兵检查静默丢弃——这依赖入站 metadata 随会话回流出站，与 `reply_with_quote` 使用 `metadata.message_id` 是同一机制。
 
 ## 7. 发送与路由
 
