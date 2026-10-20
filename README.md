@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Octop](https://img.shields.io/badge/Octop-channel%20plugin-6f42c1.svg)](https://github.com/TencentCloud/Octop)
 
-[功能](#功能) · [安装](#安装) · [配置](#配置) · [NapCat 配置](docs/napcat.md) · [设计](docs/design.md) · [常见问题](#常见问题)
+[功能](#功能) · [安装](#安装) · [配置](#配置) · [NapCat 配置](docs/napcat.md) · [设计](docs/design.md) · [开发文档](docs/development.md) · [常见问题](#常见问题)
 
 </div>
 
@@ -298,7 +298,7 @@ octop-onebot11/
 │     └─ main.py
 ├─ tools/                      # mock NapCat 与测试脚本
 ├─ deploy/                     # Windows 一键部署脚本、NapCat 配置模板
-├─ docs/                       # 设计与 NapCat 配置说明
+├─ docs/                       # 开发手记、设计说明、NapCat 配置
 └─ .github/workflows/ci.yml
 ```
 
@@ -307,6 +307,16 @@ octop-onebot11/
 - 在 Octop 5.8.x + websockets 15.0.1 + NapCat 上验证。
 - 使用 `websockets.asyncio.server` 时要求 websockets ≥ 13；更低版本自动回退到 `websockets.serve`。
 - 依赖 Octop 的 `PluginContext.channel()` 扩展点。Octop 升级后若该接口变动，需要同步回归 `setup()` 与 `BaseChannel` 契约。
+
+## 参与开发
+
+开发环境搭建、代码地图、开发约定、常见任务与路线图见 [docs/development.md](docs/development.md)。
+
+当前优先事项：
+
+1. 通道配置热更新接口（R1，详见开发文档第 9 节）
+2. 主动发送 outbox 与重试
+3. 群白名单与发送配额
 
 ## License
 
