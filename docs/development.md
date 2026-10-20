@@ -293,27 +293,11 @@ self.max_image_bytes = _to_int(self.max_image_bytes, 10 * 1024 * 1024)
 
 ## 8. 路线图
 
-优先级：P0 阻塞使用 / P1 影响体验 / P2 增强。
+开发计划、待办优先级、验收标准与需求状态统一记录在 [ROADMAP.md](../ROADMAP.md)。本文件只保留开发环境、代码结构与设计说明，不再重复计划内容。
 
-| 优先级 | 事项 | 价值 | 预估 | 依赖 |
-|---|---|---|---|---|
-| P0 | **配置热更新接口（R1，见第 9 节）**：Phase 1 脚本已含 `--api-url` HTTP PATCH 热生效模式（v0.5.0）；Phase 2/3 增量 `/config` 接口与 `apply_config` 钩子需向 Octop 核心提 PR | 不再手动改库 + 重启 | — | Octop 核心 PATCH |
-| P0 | ~~发送 outbox + 重试~~ **v0.3.0 已完成（内存级）** | 断线期间主动消息不丢 | — | 持久化留待后续 |
-| P1 | ~~跨部署形态安装/迭代脚本（R2）~~ **v0.3.0 已完成：`deploy/install.sh`** | 兼容 Docker / compose / systemd 裸机 | — | — |
-| P1 | ~~群白名单 / 发送配额~~ **v0.3.0 已完成** | 防止 Agent 误发、降低风控 | — | — |
-| P1 | ~~主动发送支持图片 / @~~ **v0.3.0 已完成：`push_segments`** | 工具能力对齐回复路径 | — | — |
-| P1 | ~~notice/request 事件处理~~ **v0.4.0 已完成** | 好友/群邀请自动通过、戳一戳触发、撤回/入群日志 | — | — |
-| P1 | ~~入站发送人白名单~~ **v0.4.0 已完成** | `allowed_senders` / `blocked_senders`（黑名单优先） | — | — |
-| P1 | ~~HTTP API 备用发送通道~~ **v0.4.0 已完成** | WS 断开时出站 action 走 `http_api_url`（含 outbox 补发） | — | — |
-| P1 | ~~群巡检 monitor + 节流~~ **v0.4.0 已完成** | 周期摘要触发 Agent，间隔/每小时上限双重节流 + 跳过哨兵 | — | — |
-| P1 | ~~主动发送引用 / 合并转发 / 结构化 at~~ **v0.4.0 已完成** | `reply_to_message_id`、`onebot11_send_forward_group`、`metadata.mentions`、`resolve_forward` | — | — |
-| P1 | ~~多账号（反向多连接路由）~~ **v0.5.0 已完成** | 一个通道接多个 QQ | — | — |
-| P2 | ~~outbox 持久化~~ **v0.5.0 已完成（文件级，`~/.octop/onebot11/state`）** | Octop 重启后排队消息不丢 | — | — |
-| P1 | ~~审计修复~~ **v0.6.0 已完成（第 13 节）** | 收包死锁、反向监听默认开放、本地文件读取、重试放大、提示注入等 | — | — |
-| P2 | 指标与健康检查 | 可观测性 | 1–2 人日 | — |
-| P2 | 配置向导 / 表单联动 | 降低配置门槛 | 2–3 人日 | Dashboard 支持 |
+## 9. 设计稿 R1：通道配置热更新接口
 
-## 9. 新需求 R1：通道配置热更新接口
+> 状态与排期见 [ROADMAP.md](../ROADMAP.md)：Phase 1（`scripts/patch_channel.py`）已实现，Phase 2/3 待 Octop 核心 PR。
 
 ### 9.1 背景
 
@@ -526,7 +510,7 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 | E2E | 改关键词后，同一群里非 @ 消息从“不入队”变为“入队” |
 | 回归 | 旧 `PATCH .../channels/{id}` 行为不变 |
 
-## 10. 新需求 R2：跨部署形态安装/迭代脚本
+## 10. 已实现 R2：跨部署形态安装/迭代脚本
 
 ### 10.1 背景
 
@@ -633,7 +617,7 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 ### 发布
 
 1. 更新 `plugins/*/plugin.yaml` 的 `version`，同时更新 README 徽章与本文件开头的“当前版本”（`test_plugin_regression.py` 的 `docs_and_manifests_agree_on_version` 会检查三者一致）。
-2. 更新 README 变更说明。
+2. 更新 [ROADMAP.md](../ROADMAP.md) 的里程碑与待办状态。
 3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。
 4. `gh release create vX.Y.Z --generate-notes`。
 5. 部署验证：`plugin install --force` → `restart` → 日志确认 `applied ... onebot11`。
