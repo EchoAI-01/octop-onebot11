@@ -1,5 +1,5 @@
 id: octop-onebot11
-version: 0.5.0
+version: 0.5.1
 name: OneBot 11 (NapCat)
 kind: channel
 entry: main.py

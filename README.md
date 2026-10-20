@@ -6,7 +6,7 @@
 
 正向 / 反向 WebSocket · 群聊触发门控 · 主动发送 · 断线排队补发 · 单文件、无额外依赖
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Octop](https://img.shields.io/badge/Octop-channel%20plugin-6f42c1.svg)](https://github.com/TencentCloud/Octop)

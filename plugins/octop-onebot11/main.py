@@ -158,6 +158,75 @@ def _normalize_path(value: Any) -> str:
     return text
 
 
+# Reply policies are exposed as dropdowns in the dashboard, but configs saved
+# by older builds (or by hand) may contain free text.  Canonicalize known
+# spellings — including the Chinese option labels — and fall back to the
+# default for anything else, so a mistyped value can never leave the channel
+# in an undefined half-state.
+_CHOICE_ALIASES: dict[str, dict[str, str]] = {
+    "group_reply_mode": {
+        "mention": "mention",
+        "@": "mention",
+        "at": "mention",
+        "仅被@时回复": "mention",
+        "仅被@或关键词时回复": "mention",
+        "仅@或关键词时回复": "mention",
+        "提及": "mention",
+        "always": "always",
+        "all": "always",
+        "全部回复": "always",
+        "回复所有消息": "always",
+        "每条消息都回复": "always",
+        "off": "off",
+        "none": "off",
+        "disable": "off",
+        "disabled": "off",
+        "不回复": "off",
+        "不回复群聊": "off",
+        "关闭": "off",
+        "禁用": "off",
+    },
+    "private_reply_mode": {
+        "always": "always",
+        "all": "always",
+        "全部回复": "always",
+        "回复所有私聊": "always",
+        "keyword": "keyword",
+        "keywords": "keyword",
+        "关键词": "keyword",
+        "仅关键词触发": "keyword",
+        "仅关键词触发时回复": "keyword",
+        "off": "off",
+        "none": "off",
+        "disable": "off",
+        "disabled": "off",
+        "不回复": "off",
+        "不回复私聊": "off",
+        "关闭": "off",
+        "禁用": "off",
+    },
+}
+
+
+def _normalize_choice(value: Any, field_name: str, default: str) -> str:
+    """Map a stored reply-policy value onto its canonical spelling."""
+    allowed = _CHOICE_ALIASES.get(field_name, {})
+    text = re.sub(r"\s+", "", str(value or "")).lower()
+    if not text:
+        return default
+    canonical = allowed.get(text)
+    if canonical is None:
+        logger.warning(
+            "OneBot11 config: invalid %s=%r — falling back to %r (valid: %s)",
+            field_name,
+            value,
+            default,
+            ", ".join(sorted(set(allowed))),
+        )
+        return default
+    return canonical
+
+
 class OneBotAPIError(RuntimeError):
     """A OneBot action returned ``status=failed`` or a non-zero retcode."""
 
@@ -323,6 +392,10 @@ class OneBot11Config(ChannelConfig):
         self.send_rate_limit_window = max(1.0, _to_float(self.send_rate_limit_window, 60.0))
         self.group_context.history_limit = max(0, int(self.group_history_limit))
         self.group_context.history_ttl_seconds = max(0.0, float(self.group_history_ttl_seconds))
+        self.group_reply_mode = _normalize_choice(self.group_reply_mode, "group_reply_mode", "mention")
+        self.private_reply_mode = _normalize_choice(
+            self.private_reply_mode, "private_reply_mode", "always"
+        )
         self.connection_mode = self.normalized_mode()
         self.listen_port = _to_int(self.listen_port, 3002)
         self.listen_path = _normalize_path(self.listen_path)
@@ -2244,14 +2317,22 @@ _QQ_ICON = "data:image/svg+xml,%3c?xml%20version='1.0'%20standalone='no'?%3e%3c!
 # Plugin entry point
 # ----------------------------------------------------------------------
 
+# Channel intro shown on the dashboard channel card and in the drawer banner.
+# The harness registration API carries no description field and the shipped
+# i18n bundles have no ``channels.intro_onebot11`` key, so the dashboard would
+# fall back to the label; ``scripts/patch_dashboard.py`` reads this constant
+# (single source of truth) and injects it into the deployed bundle.
+_CHANNEL_INTRO = "通过 OneBot 11 协议接入 QQ 机器人（NapCat 等实现），支持正向/反向 WebSocket、群聊与私聊回复策略及白名单管控，接入后可在 QQ 中直接对话。"
+
 _FIELDS: list[dict[str, Any]] = [
+    # ---- 连接设置 ----
     {
         "name": "connection_mode",
         "label": "连接方式",
         "type": "select",
-        "placeholder": "forward",
+        "placeholder": "默认：正向（Octop 连接 NapCat）",
         "required": False,
-        "helpKey": "onebot11.connectionMode",
+        "help": "正向：Octop 主动连接 NapCat 的 WebSocket 服务；反向：NapCat 主动连接 Octop，适合 NAS / 内网 / 无公网地址的部署。",
         "options": [
             {"label": "正向：Octop 连接 NapCat", "value": "forward"},
             {"label": "反向：NapCat 连接 Octop", "value": "reverse"},
@@ -2259,63 +2340,64 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "ws_url",
-        "label": "NapCat WebSocket 地址（正向模式）",
+        "label": "NapCat WebSocket 地址",
         "type": "text",
-        "placeholder": "ws://maim-bot-napcat:3001（反向模式可留空）",
+        "placeholder": "ws://127.0.0.1:3001",
         "required": False,
-        "helpKey": "onebot11.wsUrl",
+        "help": "正向模式必填，指向 NapCat 的 WebSocket 服务；反向模式留空。",
     },
     {
         "name": "token",
-        "label": "Access Token",
+        "label": "访问令牌（Access Token）",
         "type": "password",
-        "placeholder": "正向=发送给 NapCat；反向=校验 NapCat 携带（可留空）",
+        "placeholder": "与 NapCat 侧配置保持一致",
         "required": False,
-        "helpKey": "onebot11.token",
+        "help": "正向模式发送给 NapCat 校验，反向模式用于校验 NapCat 携带的令牌；留空表示不启用鉴权。",
     },
     {
         "name": "listen_host",
         "label": "反向监听地址",
         "type": "text",
-        "placeholder": "0.0.0.0（反向模式）",
+        "placeholder": "0.0.0.0",
         "required": False,
-        "helpKey": "onebot11.listenHost",
+        "help": "反向模式的监听地址，一般保持 0.0.0.0（监听所有网卡）。",
     },
     {
         "name": "listen_port",
         "label": "反向监听端口",
         "type": "number",
-        "placeholder": "3002（反向模式）",
+        "placeholder": "3002",
         "required": False,
-        "helpKey": "onebot11.listenPort",
+        "help": "反向模式的监听端口（默认 3002），需与 NapCat 的反向 WebSocket 配置一致。",
     },
     {
         "name": "listen_path",
         "label": "反向监听路径",
         "type": "text",
-        "placeholder": "/onebot/v11/ws（反向模式）",
+        "placeholder": "/onebot/v11/ws",
         "required": False,
-        "helpKey": "onebot11.listenPath",
+        "help": "反向模式的 WS 路径；NapCat 连接地址形如 ws://<Octop地址>:<端口>/onebot/v11/ws。",
     },
     {
         "name": "self_id",
         "label": "机器人 QQ 号",
         "type": "text",
-        "placeholder": "留空则自动从 get_login_info 获取",
+        "placeholder": "留空则登录后自动获取",
         "required": False,
-        "helpKey": "onebot11.selfId",
+        "help": "留空即可自动获取；反向多账号模式下用于区分不同机器人账号。",
     },
+    # ---- 回复策略 ----
     {
         "name": "group_reply_mode",
         "label": "群聊回复策略",
         "type": "select",
-        "placeholder": "mention",
+        "placeholder": "默认：仅被 @ 或关键词时回复",
         "required": False,
-        "helpKey": "onebot11.groupReplyMode",
+        "help": "控制机器人在群里什么时候应答。“全部回复”会对群内每条消息调用模型，可能产生较多消息和调用费用。",
         "options": [
-            {"label": "仅 @ 或关键词时回复", "value": "mention"},
-            {"label": "回复所有消息", "value": "always"},
-            {"label": "不回复群聊", "value": "off"},
+            {"label": "仅被 @ 或关键词时回复（推荐）", "value": "mention"},
+            {"label": "全部回复（每条群消息都应答）", "value": "always"},
+            {"label": "不回复（只接收不应答）", "value": "off"},
         ],
     },
     {
@@ -2324,19 +2406,19 @@ _FIELDS: list[dict[str, Any]] = [
         "type": "text",
         "placeholder": "逗号分隔，例如：小助手,日报,提醒",
         "required": False,
-        "helpKey": "onebot11.triggerKeywords",
+        "help": "消息包含任一关键词即触发回复；供群聊“仅被 @ 或关键词时回复”与私聊“仅关键词触发”使用，留空表示不启用关键词触发。",
     },
     {
         "name": "private_reply_mode",
         "label": "私聊回复策略",
         "type": "select",
-        "placeholder": "always",
+        "placeholder": "默认：全部回复",
         "required": False,
-        "helpKey": "onebot11.privateReplyMode",
+        "help": "控制机器人对私聊消息的应答方式。",
         "options": [
-            {"label": "回复所有私聊", "value": "always"},
-            {"label": "仅关键词触发", "value": "keyword"},
-            {"label": "不回复私聊", "value": "off"},
+            {"label": "全部回复（默认）", "value": "always"},
+            {"label": "仅关键词触发时回复", "value": "keyword"},
+            {"label": "不回复（只接收不应答）", "value": "off"},
         ],
     },
     {
@@ -2345,95 +2427,90 @@ _FIELDS: list[dict[str, Any]] = [
         "type": "number",
         "placeholder": "10",
         "required": False,
-        "helpKey": "onebot11.groupHistoryLimit",
+        "help": "回复时携带的最近群消息条数（默认 10），0 表示不携带历史。",
     },
     {
         "name": "reply_with_quote",
         "label": "引用回复",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.replyWithQuote",
+        "help": "回复时引用触发消息，便于在群内对应上下文。",
     },
+    # ---- 范围过滤 ----
     {
         "name": "allowed_groups",
         "label": "群白名单",
         "type": "text",
-        "placeholder": "逗号分隔群号，留空不限制，例如：123456789,987654321",
+        "placeholder": "逗号分隔群号，例如：123456789,987654321",
         "required": False,
-        "helpKey": "onebot11.allowedGroups",
+        "help": "只处理这些群的消息；留空表示不限制。群号填错仅导致该群不生效，不影响其他群。",
     },
     {
         "name": "allowed_users",
         "label": "私聊白名单",
         "type": "text",
-        "placeholder": "逗号分隔 QQ 号，留空不限制",
+        "placeholder": "逗号分隔 QQ 号",
         "required": False,
-        "helpKey": "onebot11.allowedUsers",
-    },
-    {
-        "name": "outbox_enabled",
-        "label": "断线排队发送",
-        "type": "switch",
-        "placeholder": "true",
-        "required": False,
-        "helpKey": "onebot11.outboxEnabled",
+        "help": "只处理这些 QQ 号的私聊消息；留空表示不限制。",
     },
     {
         "name": "allowed_senders",
         "label": "发送人白名单",
         "type": "text",
-        "placeholder": "逗号分隔 QQ 号，留空不限制（入站）",
+        "placeholder": "逗号分隔 QQ 号",
         "required": False,
-        "helpKey": "onebot11.allowedSenders",
+        "help": "入站过滤：只接收这些发送人的消息（群聊、私聊均生效）；留空表示不限制。",
     },
     {
         "name": "blocked_senders",
         "label": "发送人黑名单",
         "type": "text",
-        "placeholder": "逗号分隔 QQ 号，优先于白名单",
+        "placeholder": "逗号分隔 QQ 号",
         "required": False,
-        "helpKey": "onebot11.blockedSenders",
+        "help": "入站过滤：忽略这些发送人的消息；黑名单优先于白名单。",
+    },
+    # ---- 高级功能 ----
+    {
+        "name": "monitor_enabled",
+        "label": "群巡检",
+        "type": "switch",
+        "required": False,
+        "help": "仅在群聊“仅被 @ 或关键词时回复”策略下生效：把未触发回复的群消息定期汇总给 AI 主动关注，内置频率限制。",
     },
     {
         "name": "poke_triggers_reply",
         "label": "戳一戳触发回复",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.pokeTriggersReply",
+        "help": "被戳一戳时触发一次回复。",
     },
     {
         "name": "auto_accept_friend_request",
         "label": "自动通过好友请求",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.autoAcceptFriendRequest",
+        "help": "收到好友申请时自动同意。",
     },
     {
         "name": "auto_accept_group_invite",
         "label": "自动通过群邀请",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.autoAcceptGroupInvite",
+        "help": "收到入群邀请时自动同意进群。",
     },
     {
-        "name": "monitor_enabled",
-        "label": "群巡检",
+        "name": "outbox_enabled",
+        "label": "离线排队发送",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.monitorEnabled",
+        "help": "默认开启：断线期间的主动消息进入队列（已持久化，重启不丢），恢复连接后自动补发。",
     },
     {
         "name": "multi_account",
         "label": "多账号（反向）",
         "type": "switch",
-        "placeholder": "false",
         "required": False,
-        "helpKey": "onebot11.multiAccount",
+        "help": "反向模式下允许同一通道接入多个 NapCat 账号，按机器人 QQ 号自动路由收发。",
     },
 ]
 

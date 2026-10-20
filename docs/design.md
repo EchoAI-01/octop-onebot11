@@ -23,7 +23,18 @@ def setup(ctx):
     )
 ```
 
-`fields` 是 Dashboard 表单的声明式 schema（`name/label/type/placeholder/required/helpKey/options`），配置值最终落到 `channels.config_json`，由 `ChannelConfig.from_dict()` 映射进 `OneBot11Config` dataclass。
+`fields` 是 Dashboard 表单的声明式 schema（`name/label/type/placeholder/required/help/options`），配置值最终落到 `channels.config_json`，由 `ChannelConfig.from_dict()` 映射进 `OneBot11Config` dataclass。
+
+> **注意（v0.5.1 UI）**：Octop Dashboard 原生渲染链路对插件通道有三处缺口：
+> `FormItemForField` 不支持 `type: "select"`（退化为纯文本框）；入口 chunk 的
+> 字段白名单会把 `select` 重置为 `text` 并丢弃 `options`/`help`；卡片与抽屉横幅
+> 的简介走 i18n 键 `channels.intro_<kind>`，插件通道无此键而回退为 label。
+> 本仓库提供 `scripts/patch_dashboard.py` 对已部署的 Dashboard bundle 做最小注入
+> 补齐三者：`select`（AntD 下拉，消费 `options` 的 label/value）、`help`（字段下方
+> 的中文说明）、简介（读取插件 `_CHANNEL_INTRO` 常量，单一事实源）。脚本以
+> `*.orig` 备份为基全量重建，改文案后重跑即可；带 `node --check` 校验与
+> `--restore` 回滚。部署或升级 Octop 后需重跑。`help` 与简介均为字面文案，不依赖
+> Dashboard 语言包，因此无需上游 i18n 键。
 
 ## 2. 通道契约
 
