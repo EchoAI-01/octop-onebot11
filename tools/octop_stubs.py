@@ -114,6 +114,14 @@ class BaseChannel:
     async def _acquire_rate_slot(self):
         self.rate_slots += 1
 
+    async def _preprocess_inbound(self, message):
+        """Core hook (default: nothing to do)."""
+
+    async def handle_inbound(self, raw_payload):
+        """The part of the core's inbound template the plugin hooks into."""
+        message = self.parse_inbound(raw_payload)
+        await self._preprocess_inbound(message)
+
     def resolve_push_subject(self, subject):
         return subject
 
@@ -139,12 +147,19 @@ class ImageContent:
     url: str = ""
     alt_text: str = ""
     data: str | None = None
+    mime_type: str | None = None
+    size: int | None = None
+    local_path: str | None = None
     type: str = "image"
 
 
 @dataclass
 class AudioContent:
     url: str = ""
+    mime_type: str | None = None
+    size: int | None = None
+    local_path: str | None = None
+    data: str | None = None
     type: str = "audio"
 
 

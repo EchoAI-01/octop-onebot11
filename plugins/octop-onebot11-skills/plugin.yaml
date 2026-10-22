@@ -1,0 +1,12 @@
+id: octop-onebot11-skills
+version: 0.7.0
+name: OneBot 11 Agent Skills
+kind: skill
+entry: main.py
+description: >-
+  Agent skill for working in QQ through the octop-onebot11 channel: how group
+  messages are labelled (nickname + QQ number + time), when to look up chat
+  history instead of guessing, how to react / recall / moderate safely, and
+  what the proactive-sending tools can and cannot do.  Documentation only; the
+  tools themselves live in octop-onebot11-tools.
+requires: []

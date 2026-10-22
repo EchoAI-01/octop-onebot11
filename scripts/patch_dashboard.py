@@ -26,7 +26,11 @@ This script injects, into the deployed bundle:
    kinds, read from the plugin's ``_CHANNEL_INTRO`` constant — the dashboard
    otherwise falls back to the channel label because shipped i18n bundles
    carry no ``channels.intro_<plugin-kind>`` key;
-5. a matching ``revision`` bump for the chunk's entry in ``sw.js`` so
+5. conditional fields: a field carrying ``showWhen`` (``{"field": "connection_mode",
+   "equals": "reverse"}`` or ``"notEquals"``) is only rendered while the
+   controlling form value matches, so e.g. the forward-only ``ws_url`` and the
+   reverse-only listener fields never show up together;
+6. a matching ``revision`` bump for the chunk's entry in ``sw.js`` so
    service-worker-precached deployments (HTTPS origins) re-fetch it.
 
 The patch is anchor-based and refuses to run when the bundle shape differs
@@ -70,7 +74,7 @@ import tempfile
 from pathlib import Path
 
 PATCH_MARKER = 'field.type==="select"'
-SW_REVISION = "select-p1"
+SW_REVISION = "select-p2"
 
 # The entry chunk sanitizes plugin-contributed fields through a whitelist:
 # any type outside {password, textarea, json, switch} becomes "text" and
@@ -93,6 +97,13 @@ SANITIZER_NEW = (
     'helpKey:f!=null&&f.helpKey?String(f.helpKey):void 0}'
 )
 SANITIZER_MARKER = "options:Array.isArray(f==null?void 0:f.options)?f.options:void 0"
+# Second, independent step so a bundle widened by an older script gets upgraded too.
+SHOWWHEN_TAIL_OLD = "helpKey:f!=null&&f.helpKey?String(f.helpKey):void 0}"
+SHOWWHEN_TAIL_NEW = (
+    "helpKey:f!=null&&f.helpKey?String(f.helpKey):void 0,"
+    'showWhen:f!=null&&f.showWhen&&typeof f.showWhen==="object"?f.showWhen:void 0}'
+)
+SHOWWHEN_MARKER = 'showWhen:f!=null&&f.showWhen&&typeof f.showWhen==="object"'
 
 # Channel card + drawer banner resolve their description through i18n keys
 # (``channels.intro_<kind>``) that only exist for builtin channels; plugin
@@ -125,6 +136,21 @@ SELECT_BRANCH = (
     "value:opt?opt.value:undefined})"
     ")})});"
 )
+
+
+# Renders the original component only while the controlling field matches.
+# ``noStyle`` + ``shouldUpdate`` is AntD's own mechanism for dependent fields.
+SHOWWHEN_WRAPPER = (
+    "function FormItemForField(props){"
+    "const cond=props.field&&props.field.showWhen;"
+    "if(!cond||!cond.field)return __JSX__.jsx(FormItemForFieldBase,props);"
+    "return __JSX__.jsx(__FORM__.Item,{noStyle:!0,"
+    "shouldUpdate:(prev,next)=>prev[cond.field]!==next[cond.field],"
+    "children:form=>{const current=form.getFieldValue(cond.field),"
+    "shown=cond.equals!==void 0?current===cond.equals:current!==cond.notEquals;"
+    "return shown?__JSX__.jsx(FormItemForFieldBase,props):null}})}"
+)
+SHOWWHEN_CHUNK_MARKER = "function FormItemForFieldBase("
 
 
 def die(msg: str) -> None:
@@ -179,10 +205,17 @@ def find_chunk_by(assets: str, marker: str) -> str | None:
 
 
 def patch_entry_text(text: str) -> str:
-    if text.count(SANITIZER_OLD) != 1:
-        die(f"sanitizer anchor occurs {text.count(SANITIZER_OLD)} times (expected 1); "
-            "bundle shape changed — update this script's anchors")
-    return text.replace(SANITIZER_OLD, SANITIZER_NEW, 1)
+    if SANITIZER_MARKER not in text:
+        if text.count(SANITIZER_OLD) != 1:
+            die(f"sanitizer anchor occurs {text.count(SANITIZER_OLD)} times (expected 1); "
+                "bundle shape changed — update this script's anchors")
+        text = text.replace(SANITIZER_OLD, SANITIZER_NEW, 1)
+    if SHOWWHEN_MARKER not in text:
+        if text.count(SHOWWHEN_TAIL_OLD) != 1:
+            die(f"showWhen anchor occurs {text.count(SHOWWHEN_TAIL_OLD)} times (expected 1); "
+                "bundle shape changed — update this script's anchors")
+        text = text.replace(SHOWWHEN_TAIL_OLD, SHOWWHEN_TAIL_NEW, 1)
+    return text
 
 
 def load_plugin_intro() -> str:
@@ -281,6 +314,11 @@ def patch_chunk_text(text: str) -> str:
         1,
     )
 
+    # d) conditional fields: the original becomes ...Base, a thin wrapper decides visibility.
+    if new_body.count("function FormItemForField(") != 1:
+        die("FormItemForField declaration not unique; cannot add the showWhen wrapper")
+    new_body = new_body.replace("function FormItemForField(", SHOWWHEN_CHUNK_MARKER, 1) + sub(SHOWWHEN_WRAPPER)
+
     return text[:start] + new_body + text[end:]
 
 
@@ -291,16 +329,19 @@ def patch_sw_manifest(dashboard: str, chunk_name: str, dry_run: bool) -> str:
         return "sw.js: not found (skipped)"
     with open(sw_path, encoding="utf-8") as fh:
         text = fh.read()
-    entry = f'{{url:"assets/{chunk_name}",revision:null}}'
     patched_entry = f'{{url:"assets/{chunk_name}",revision:"{SW_REVISION}"}}'
     if patched_entry in text:
         return "sw.js: already patched"
-    if text.count(entry) != 1:
+    # Pristine entry, or one bumped by an earlier revision of this script.
+    entry = re.compile(
+        r'\{url:"assets/%s",revision:(?:null|"select-p\d+")\}' % re.escape(chunk_name)
+    )
+    if len(entry.findall(text)) != 1:
         return f"sw.js: precache entry for {chunk_name} not found verbatim (skipped)"
     if not dry_run:
         backup_once(sw_path)
         with open(sw_path, "w", encoding="utf-8") as fh:
-            fh.write(text.replace(entry, patched_entry, 1))
+            fh.write(entry.sub(lambda _m: patched_entry, text, count=1))
     return "sw.js: precache revision bumped"
 
 
@@ -333,7 +374,7 @@ def patch_entry_chunk(dashboard: str, args: argparse.Namespace) -> None:
     name = os.path.basename(entry)
     with open(entry, encoding="utf-8") as fh:
         etext = fh.read()
-    if SANITIZER_MARKER in etext:
+    if SANITIZER_MARKER in etext and SHOWWHEN_MARKER in etext:
         print(f"{name}: sanitizer already widened — nothing to do")
         return
     patched_entry = patch_entry_text(etext)  # validates anchors before any write
@@ -344,7 +385,7 @@ def patch_entry_chunk(dashboard: str, args: argparse.Namespace) -> None:
     backup_once(entry)
     with open(entry, "w", encoding="utf-8") as fh:
         fh.write(patched_entry)
-    print(f"{name}: sanitizer widened to select/options/help "
+    print(f"{name}: sanitizer widened to select/options/help/showWhen "
           f"(+{len(patched_entry) - len(etext)} bytes, backup at {name}.orig)")
     print(node_syntax_check(entry))
 
@@ -378,6 +419,9 @@ def run_local(args: argparse.Namespace) -> None:
     if " as Select" not in base:
         die("chunk does not import an AntD `Select` binding; cannot inject")
 
+    if PATCH_MARKER in base and SHOWWHEN_CHUNK_MARKER not in base:
+        die(f"{chunk_name} was patched by an older version of this script and has no pristine "
+            f"backup ({chunk_name}.orig); restore the original bundle (or reinstall Octop), then re-run")
     patched = base if PATCH_MARKER in base else patch_chunk_text(base)
     patched = patch_intros(patched, load_plugin_intro())
     if args.dry_run:
@@ -399,12 +443,62 @@ def run_local(args: argparse.Namespace) -> None:
     print("reminder: assets are immutable-cached — hard-reload the channels page once")
 
 
+def run_container(args: argparse.Namespace) -> None:
+    """Patch the dashboard inside a running Docker container.
+
+    The bundle lives in the image's site-packages, so it is copied out with
+    ``docker cp``, patched locally with the very same logic, and copied back.
+    The container only needs to be running; no tooling is required inside it.
+    """
+    container = args.container
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container):
+        die("--container must be a plain container name")
+    locate = subprocess.run(
+        [
+            "docker", "exec", container, "python3", "-c",
+            "import os, octop; print(os.path.join(os.path.dirname(octop.__file__), 'dashboard'))",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    remote_dashboard = locate.stdout.strip()
+    if locate.returncode != 0 or not remote_dashboard.startswith("/"):
+        die(f"cannot locate the dashboard inside container {container!r}: "
+            f"{(locate.stderr or locate.stdout).strip()[:300]}")
+    with tempfile.TemporaryDirectory(prefix="ob11-dash-") as tmp:
+        local = os.path.join(tmp, "dashboard")
+        os.makedirs(local)
+        pulled = subprocess.run(
+            ["docker", "cp", f"{container}:{remote_dashboard}/.", local],
+            capture_output=True,
+            text=True,
+        )
+        if pulled.returncode != 0:
+            die(f"docker cp (out) failed: {pulled.stderr.strip()[:300]}")
+        local_args = argparse.Namespace(
+            dashboard_dir=local, dry_run=args.dry_run, restore=args.restore, host=None, container=None
+        )
+        run_local(local_args)
+        if args.dry_run:
+            return
+        pushed = subprocess.run(
+            ["docker", "cp", f"{local}/.", f"{container}:{remote_dashboard}"],
+            capture_output=True,
+            text=True,
+        )
+        if pushed.returncode != 0:
+            die(f"docker cp (in) failed: {pushed.stderr.strip()[:300]}")
+    print(f"container {container}: dashboard updated in place (restart not required)")
+
+
 def run_remote(args: argparse.Namespace) -> None:
     """Upload this script to the host and execute it with the octop venv python."""
     self_path = os.path.abspath(__file__)
     forwarded: list[str] = []
     if args.dashboard_dir:
         forwarded += ["--dashboard-dir", args.dashboard_dir]
+    if args.container:
+        forwarded += ["--container", args.container]
     if args.dry_run:
         forwarded.append("--dry-run")
     if args.restore:
@@ -439,11 +533,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", help="ssh target, e.g. user@octop-host (omit to run locally)")
     parser.add_argument("--dashboard-dir", help="octop dashboard dir (default: auto-detect)")
+    parser.add_argument(
+        "--container",
+        help="docker container running Octop: copy the dashboard out, patch, copy it back "
+        "(combine with --host to do it on a remote Docker host)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="report without writing")
     parser.add_argument("--restore", action="store_true", help="restore the pre-patch backup")
     args = parser.parse_args()
     if args.host:
         run_remote(args)
+    elif args.container:
+        run_container(args)
     else:
         run_local(args)
 

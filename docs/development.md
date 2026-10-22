@@ -8,12 +8,12 @@
 | 项 | 值 |
 |---|---|
 | 定位 | Octop 的 OneBot 11 / NapCat 通道插件，让 Octop 接入个人 QQ |
-| 组成 | 1 个 channel 插件 + 1 个 tool 插件 + 测试/部署/运维脚本 |
-| 代码量 | 插件约 3.6k 行（通道 3.2k + 工具 0.4k），测试与测试夹具约 4.2k 行，运维/部署脚本约 1.1k 行 |
+| 组成 | 1 个 channel 插件 + 1 个 tool 插件 + 1 个 skill 插件 + 测试/部署/运维脚本 |
+| 代码量 | 插件约 8.3k 行（通道 6.5k + 工具 1.6k + skill 0.2k），测试与测试夹具约 7.1k 行，运维/部署脚本约 1.4k 行 |
 | 运行环境 | Octop 进程内，由插件加载器动态导入 |
-| 外部依赖 | 仅 `websockets`（Octop 已内置，验证 15.0.1）；HTTP 回退用标准库 `urllib` |
+| 外部依赖 | 仅 `websockets`（Octop 已内置，验证 15.0.1）；HTTP 回退用标准库 `urllib`；记录库用标准库 `sqlite3` |
 | 支持版本 | websockets 13–17，Python 3.12+ |
-| 当前版本 | v0.6.0 |
+| 当前版本 | v0.7.0 |
 
 ### 仓库结构
 
@@ -22,10 +22,18 @@ octop-onebot11/
 ├─ plugins/
 │  ├─ octop-onebot11/            # channel 插件，入口 setup(ctx)
 │  │  ├─ plugin.yaml             # id / kind: channel / entry
-│  │  └─ main.py                 # 配置类 + 通道实现 + 字段 schema
-│  └─ octop-onebot11-tools/      # tool 插件，入口 setup(ctx)
-│     ├─ plugin.yaml             # id / kind: tool
-│     └─ main.py                 # onebot11_send_group / _private / _forward_group
+│  │  ├─ main.py                 # 配置类 + 通道实现 + 字段 schema
+│  │  ├─ history.py              # 聊天记录持久化（SQLite，R10）
+│  │  ├─ media.py                # 入站媒体抓取 / ASR 客户端（R11）
+│  │  ├─ probe.py                # 本机 NapCat 探测（R6）
+│  │  └─ autoreply.py            # 自主参与打分门控（R8）
+│  ├─ octop-onebot11-tools/      # tool 插件，入口 setup(ctx)
+│  │  ├─ plugin.yaml             # id / kind: tool
+│  │  └─ main.py                 # 13 个 onebot11_* Agent 工具
+│  └─ octop-onebot11-skills/     # skill 插件（纯文档，教 Agent 用上面的工具）
+│     ├─ plugin.yaml             # id / kind: skill
+│     ├─ main.py                 # 注册 skills/ 目录
+│     └─ skills/qq-onebot11/     # SKILL.md + references/tools.md
 ├─ tools/
 │  ├─ mock_napcat.py             # 假 NapCat：WS/HTTP 服务端 + action 响应（可模拟慢/无应答）
 │  ├─ octop_stubs.py             # octop_gateway 契约的共享替身（离线测试与回归测试用）
@@ -35,12 +43,13 @@ octop-onebot11/
 │  └─ test_plugin_core_integration.py  # 真实 octop_gateway/octop_harness 契约测试（未安装则跳过）
 ├─ scripts/
 │  ├─ patch_channel.py           # 配置读-合并-写（防 channel patch 整体替换，密钥走环境变量）
-│  └─ patch_dashboard.py         # Dashboard bundle 补丁：select / help / 简介渲染
+│  ├─ patch_dashboard.py         # Dashboard bundle 补丁：select / help / 简介 / 字段联动渲染
+│  └─ probe_napcat.py            # 命令行探测本机 NapCat（R6）
 ├─ deploy/
-│  ├─ install.sh                 # 跨形态部署脚本（systemd / docker，R2）
+│  ├─ install.sh                 # 跨形态部署脚本（systemd / docker，R2；R7 起内置 Dashboard 补丁）
 │  ├─ install.ps1                # Windows 辅助脚本（参数化，仅 Docker 形态；不创建通道）
 │  └─ onebot11_config.template.json
-├─ docs/                         # 本文件、design.md、napcat.md
+├─ docs/                         # 本文件、design.md、napcat.md、napcat-capabilities.md
 └─ .github/workflows/ci.yml
 ```
 
@@ -610,13 +619,37 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 
 - **兼容性**：默认行为有三处收紧——反向监听非回环地址必须有 token；本地图片路径默认不可用；多通道且未绑定时工具拒绝发送。升级后若现网依赖旧行为，需要分别配置 `token` / `media_allowed_dirs` / 工具的 `channel_id`。
 - **投递语义**：至少一次，不是恰好一次（见 design.md 7.1）。
-- **未覆盖**：`install.ps1` 没有在 Windows 上实跑；`get_forward_msg` 的返回结构只对 mock 与单元用例验证过；没有接入真实 QQ 账号做端到端联调。
+- **未覆盖**（部分已由后续版本补上，见第 14 节）：`install.ps1` 没有在 Windows 上实跑；真实账号端到端联调已于 2026-10-21/22 补做。
 
-## 14. 发布与交接
+## 14. v0.7.0 新增（R6–R12 联调反馈批次）
+
+按真实账号联调暴露的五个问题（ROADMAP R10–R12）与既定待办（R6/R7/R8/Q-03/Q-05/Q-07）开发。每项的机制细节见 [design.md](design.md) 与 [napcat-capabilities.md](napcat-capabilities.md)；NapCat 侧的坑（retcode 语义、消息 ID 时效、媒体 token）以 napcat-capabilities.md 为准。
+
+| 项 | 内容 | 关键实现 | 用例（`tools/test_plugin_regression.py`） |
+|---|---|---|---|
+| R10 群记录持久化 | 所有收发消息落 SQLite（`history.py`），按「昵称(QQ号) + 时间 + 内容」标注；`onebot11_query_history` / `history_overview` 按需检索 | WAL、保留期/行数上限、schema 版本校验（更新版本则停用不破坏）、渲染防伪造 | `every_accepted_message_is_stored_*` / `history_survives_a_restart_*` / `history_search_is_literal_*` / `rendered_history_cannot_forge_lines` |
+| R11 多媒体理解 | 入站图片插件代下载（`media.py`：仅 QQ 官方域名 + NapCat 自身，大小上限，不跟随跳转）；语音经 NapCat `fetch_ptt_text` 或外部 ASR 转文字 | URL 白名单、魔数嗅探、`get_image` 兜底；`asr_napcat_fallback`；「不支持的API」每连接只问一次 | `media_host_policy_*` / `inbound_media_is_registered_*` / `napcat_asr_text_is_normalised_*` |
+| R12 能力调研 | `docs/napcat-capabilities.md`：178 个 action / 23 类消息段的收发控矩阵与踩坑（读 NapCat v4.18.41 源码） | 由此修掉：合并转发 node 缺 `nickname`、`bot_offline` 状态降级、retcode=1200 误读 | `forward_nodes_carry_the_nickname_napcat_requires` / `bot_offline_notice_flags_the_channel_*` |
+| R8 自主参与 | `group_reply_mode=auto`：确定性打分器判断未被 @ 的消息是否值得交给模型（`autoreply.py`），Agent 可用〔不参与〕跳过 | 阈值 + 每群冷却 + 每小时上限；回复机器人的消息是强信号 | `auto_gate_scores_*` / `auto_mode_hands_only_worthwhile_*` / `auto_mode_silently_drops_a_decline_*` |
+| Q-03 投递回执 | 发送返回 `message_id`；超时区分「未发出」与「已发出未确认」 | 回执入本地历史库；补发结果也记录 | `push_returns_a_receipt_with_message_ids` / `receipt_distinguishes_*` |
+| R6 一键探测 | `probe.py` + `scripts/probe_napcat.py` + `onebot11_probe_napcat` 工具：扫本机/内网端口 + `get_login_info` 探针 | 仅回环与内网地址；仅管理端可调 | `probe_classifies_what_answers_on_a_port` / `probe_tool_is_operator_only_*` |
+| R7 + Q-05 Dashboard | `install.sh` 安装通道后自动执行 `patch_dashboard.py`（可 `--no-dashboard-patch`）；补丁支持 Docker 容器内 bundle 与 `showWhen` 字段联动（正向隐藏监听项、反向隐藏 `ws_url`） | 锚点式注入，bundle 变形即拒绝；假 Docker 往返测试 | `install_script_wires_the_dashboard_patch` / `dashboard_patch_round_trips_through_a_fake_docker` / `dashboard_wrapper_shows_and_hides_conditional_fields` |
+| Q-07 每会话限速 | `send_rate_limit_per_chat_count`（默认关）：滑动窗口，被动回复等槽不丢，配额拒绝退回槽位 | 与通道级限速独立 | `per_chat_quota_*` / `rejected_sends_give_their_quota_slot_back` |
+| 群管理工具 | `onebot11_react` / `recall_message` / `group_admin`（禁言/改名片/撤回他人） | 身份只认 `ContextVar` 里的真实发送者（`admin_users` 门控），不信任模型转述；fail closed | `group_admin_is_gated_by_the_verified_sender` / `recall_only_touches_the_bots_own_messages` / `requester_is_recorded_per_turn_*` |
+| skill 插件 | `octop-onebot11-skills`：SKILL.md + 工具参考表，教 Agent 何时查记录、如何安全用群管理 | 回归测试校验 skill 只提及真实存在的工具 | `the_agent_skill_is_well_formed_and_names_only_real_tools` |
+
+### 14.1 语义变化与升级注意
+
+- `group_reply_mode` 新增 `auto`；现有 `mention` / `always` / `off` 行为不变。
+- 默认开启的新行为：记录持久化（`history_enabled=true`）、消息标注带 QQ 号与时间戳（`sender_label_with_id` / `message_time_prefix`）、媒体抓取（`media_fetch_enabled=true`）。不想用要显式关闭。
+- 群管理类工具全部需要 `admin_users` 配置才会放行；未配置时直接拒绝。
+- `install.sh` 现在会尝试打 Dashboard 补丁（best-effort，失败只警告）。
+
+## 15. 发布与交接
 
 ### 发布
 
-1. 更新 `plugins/*/plugin.yaml` 的 `version`，同时更新 README 徽章与本文件开头的“当前版本”（`test_plugin_regression.py` 的 `docs_and_manifests_agree_on_version` 会检查三者一致）。
+1. 更新 `plugins/*/plugin.yaml` 的 `version`，同时更新 README 徽章与本文件开头的“当前版本”（`test_plugin_regression.py` 的 `docs_and_manifests_agree_on_version` 会检查全部 plugin.yaml、README 徽章与本文件一致）。
 2. 更新 [ROADMAP.md](../ROADMAP.md) 的里程碑与待办状态。
 3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。
 4. `gh release create vX.Y.Z --generate-notes`。
@@ -631,7 +664,7 @@ Phase 1 可以先落地：脚本解决“不想手动改库”的诉求，不依
 - [ ] 已知问题：见第 7 节；未完成事项：见第 8 节路线图。
 - [ ] 密钥：仓库内不得出现 token；配置只存 Octop DB。
 
-## 15. 参考
+## 16. 参考
 
 - Octop：<https://github.com/TencentCloud/Octop>
 - octop-gateway：<https://github.com/TencentCloud/octop-gateway>

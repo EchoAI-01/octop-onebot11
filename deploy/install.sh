@@ -14,11 +14,19 @@
 #   ./deploy/install.sh --host user@octop-host --mode docker --container octop
 #   ./deploy/install.sh --mode systemd                          # run on the Octop host itself
 #   ./deploy/install.sh --host user@octop-host --plugin tools   # only the tool plugin
+#   ./deploy/install.sh --host user@octop-host --plugin skills  # only the agent skill (docs for the agent)
 #   OCTOP_RELOAD_TOKEN=... ./deploy/install.sh --host user@octop-host   # hot reload, no restart
 #
 # The reload token can also be given as --reload-token; the environment
 # variable is preferred because command-line arguments are visible to every
 # local user in the process list.
+#
+# Dashboard dropdowns: Octop's stock dashboard renders plugin "select" fields
+# as plain text boxes.  Unless --no-dashboard-patch is given, the channel plugin
+# install is followed by scripts/patch_dashboard.py, which turns the connection
+# mode / reply-policy fields into Chinese dropdowns with help text.  The step is
+# best-effort (a changed dashboard bundle only produces a warning), idempotent,
+# and reversible with:  python3 scripts/patch_dashboard.py [--host H] --restore
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,7 +38,8 @@ UPLOADS_DIR=""       # systemd: plugin upload dir (default: <remote $HOME>/.octo
 CLI_PATH=""          # systemd: octop binary (default: auto-detect)
 RELOAD_TOKEN="${OCTOP_RELOAD_TOKEN:-}"  # admin token for POST /api/plugins/reload (optional)
 API_URL=""           # e.g. http://127.0.0.1:17792 (default: auto-detect)
-PLUGIN="all"         # channel | tools | all
+PLUGIN="all"         # channel | tools | skills | all
+DASHBOARD_PATCH=1    # 1 = patch the dashboard bundle after installing the channel plugin
 
 usage() {
   # Print only the leading comment block of this file.
@@ -57,12 +66,13 @@ while [[ $# -gt 0 ]]; do
     --reload-token) RELOAD_TOKEN="${2:?}"; shift 2 ;;
     --api-url) API_URL="${2:?}"; shift 2 ;;
     --plugin) PLUGIN="${2:?}"; shift 2 ;;
+    --no-dashboard-patch) DASHBOARD_PATCH=0; shift ;;
     -h|--help) usage ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
 
-[[ "$PLUGIN" =~ ^(channel|tools|all)$ ]] || die "--plugin must be channel|tools|all"
+[[ "$PLUGIN" =~ ^(channel|tools|skills|all)$ ]] || die "--plugin must be channel|tools|skills|all"
 [[ "$MODE" =~ ^(auto|docker|systemd)$ ]] || die "--mode must be auto|docker|systemd"
 [[ "$CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "--container must be a plain container name"
 # These values are spliced into single-quoted remote shell strings.
@@ -73,6 +83,7 @@ done
 PLUGINS=()
 if [[ "$PLUGIN" == "all" || "$PLUGIN" == "channel" ]]; then PLUGINS+=("octop-onebot11"); fi
 if [[ "$PLUGIN" == "all" || "$PLUGIN" == "tools" ]]; then PLUGINS+=("octop-onebot11-tools"); fi
+if [[ "$PLUGIN" == "all" || "$PLUGIN" == "skills" ]]; then PLUGINS+=("octop-onebot11-skills"); fi
 
 # --------------------------------------------------------------------------
 # Detection
@@ -215,6 +226,33 @@ else
 fi
 
 # --------------------------------------------------------------------------
+# Dashboard dropdowns (best-effort)
+# --------------------------------------------------------------------------
+
+patch_dashboard() {
+  local script="$ROOT/scripts/patch_dashboard.py" python_bin
+  python_bin="$(command -v python3 || command -v python || true)"
+  if [[ -z "$python_bin" ]]; then
+    echo "      skipped: python3 not found on this machine"; return 1
+  fi
+  local -a args=()
+  [[ -n "$HOST" ]] && args+=(--host "$HOST")
+  if [[ "$DEPLOY_MODE" == "docker" ]]; then args+=(--container "$CONTAINER"); fi
+  # bash 3.2 (macOS) + `set -u`: an empty array only expands safely this way.
+  "$python_bin" "$script" ${args[@]+"${args[@]}"}
+}
+
+if [[ "$DASHBOARD_PATCH" == "1" && " ${PLUGINS[*]} " == *" octop-onebot11 "* ]]; then
+  echo "[+] patching the dashboard so reply-policy fields render as dropdowns"
+  if ! patch_dashboard; then
+    echo "      WARNING: dashboard patch failed; plugin fields fall back to plain text boxes." >&2
+    echo "      Run scripts/patch_dashboard.py manually, or ignore this if you do not need dropdowns." >&2
+  else
+    echo "      done — hard-reload the channels page once (Cmd/Ctrl+Shift+R)"
+  fi
+fi
+
+# --------------------------------------------------------------------------
 # Verify
 # --------------------------------------------------------------------------
 
@@ -242,7 +280,7 @@ if [[ " ${PLUGINS[*]} " == *" octop-onebot11 "* ]]; then
   fi
   echo "      $(grep "applied [0-9]* plugin channel kind" <<<"$boot_log" | tail -1)"
 else
-  echo "      octop service is healthy; tool plugin installs silently (verify via plugin list)"
+  echo "      octop service is healthy; tool / skill plugins install silently (verify via plugin list)"
 fi
 
 octop_cli "plugin list" || true

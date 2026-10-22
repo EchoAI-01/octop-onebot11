@@ -30,6 +30,9 @@ from pathlib import Path
 _SCRATCH = tempfile.mkdtemp(prefix="ob11-offline-")
 tempfile.tempdir = _SCRATCH
 atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
+# The plugin keeps its default state (history, outbox) under ~/.octop; point
+# "home" at the scratch directory so a test run never touches the real one.
+os.environ["HOME"] = os.environ["USERPROFILE"] = _SCRATCH
 
 # ---------------------------------------------------------------------------
 # Stub octop_gateway

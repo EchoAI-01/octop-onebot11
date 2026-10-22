@@ -6,7 +6,7 @@
 
 正向 / 反向 WebSocket · 群聊触发门控 · 主动发送 · 断线排队补发
 
-[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/EchoAI-01/octop-onebot11/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Octop](https://img.shields.io/badge/Octop-channel%20plugin-6f42c1.svg)](https://github.com/TencentCloud/Octop)
@@ -21,24 +21,29 @@
 
 Octop 官方的 QQ 通道只支持 QQ 开放平台机器人（AppID + Token），无法使用个人 QQ。本插件通过 Octop 的 `kind: channel` 扩展点接入 **OneBot 11** 协议，让 Octop 收发个人 QQ 消息，兼容 [NapCat](https://github.com/NapNeko/NapCatQQ) 及其他 OneBot 11 实现。
 
-插件由两部分组成：
+插件由三部分组成：
 
 | 组件 | 类型 | 作用 |
 |---|---|---|
-| `octop-onebot11` | channel | 连接 NapCat，收发消息，处理触发策略、白名单、断线重连与排队补发 |
-| `octop-onebot11-tools` | tool | 给 Agent 提供主动发送工具（群/私聊/合并转发） |
+| `octop-onebot11` | channel | 连接 NapCat，收发消息，处理触发策略、白名单、断线重连与排队补发；持久化聊天记录供 Agent 按需查询 |
+| `octop-onebot11-tools` | tool | 给 Agent 提供 13 个操作工具（发送、查询记录、群管理、探测等） |
+| `octop-onebot11-skills` | skill | 教 Agent 怎么用这些能力的技能文档（纯文档，无代码） |
 
 ## 功能
 
 - **正向与反向连接**：`forward` 由 Octop 连接 NapCat，`reverse` 由 NapCat 连接 Octop，适配内网、NAS 与 NAT 环境。
-- **群聊触发门控**：默认只响应 `@` 或关键词，其余消息只进上下文缓存，不调用模型。
+- **群聊触发门控**：默认只响应 `@` 或关键词；可选「自主参与」在被 @ 之外对提问/求助消息判断是否插话。
 - **私聊策略**：`always` / `keyword` / `off` 三档。
-- **主动发送**：向任意群或用户发消息，支持文本、图片、@ 成员、引用与合并转发，不要求已有会话。
+- **主动发送**：向任意群或用户发消息，支持文本、图片、语音、@ 成员、引用与合并转发，不要求已有会话；发送返回 `message_id` 回执。
+- **聊天记录持久化**：所有收发的消息（含机器人自己的发言）落入本地 SQLite，按「昵称(QQ号) + 时间 + 内容」标注；Agent 通过 `onebot11_query_history` 按时间/关键词/QQ 号按需检索，替代固定条数上下文注入。
+- **多媒体理解**：入站图片由插件代为下载后交给多模态模型；语音经 NapCat 自带的语音转文字（或外部 ASR 服务）转成文本。
+- **群管理工具**：表情回应、撤回自己的消息、禁言/改名片/撤回他人消息（后者仅限 `admin_users` 名单里的真实发送者触发，不信任模型转述的身份）。
 - **断线排队补发**：主动消息在断线时进入持久化队列，重连后按序补发；也可配置 OneBot HTTP API 作为备用发送通道。
 - **多账号（反向）**：一条反向通道可接入多个 QQ，按 `self_id` 路由收发。
 - **访问控制**：群 / 私聊 / 发送人白名单与黑名单，出站目标白名单，可按 Agent 绑定通道。
-- **事件处理**：好友请求、群邀请可自动通过；戳一戳可触发回复。
+- **事件处理**：好友请求、群邀请可自动通过；戳一戳可触发回复；被踢下线时状态如实降级。
 - **群巡检**：周期性汇总未触发的群消息并唤醒 Agent，带间隔与每小时上限。
+- **一键探测**：`onebot11_probe_napcat` 工具 / `scripts/probe_napcat.py` 扫描本机 NapCat 并报告地址、令牌与登录账号，免手填。
 - **安全默认**：反向监听非本机地址必须配置 token；握手阶段拒绝未授权连接；本地媒体只能读取授权目录。
 - **弱依赖启动**：NapCat 离线或 QQ 未登录时通道照常注册，状态降级并自动重连，不阻塞 Octop 启动。
 
@@ -76,22 +81,24 @@ cd octop-onebot11
 
 octop plugin install ./plugins/octop-onebot11 --force
 octop plugin install ./plugins/octop-onebot11-tools --force
+octop plugin install ./plugins/octop-onebot11-skills --force
 ```
 
 ### Docker 部署
 
 ```bash
 # 宿主机：把插件目录放进 Octop 数据目录（路径按实际调整）
-scp -r plugins/octop-onebot11 plugins/octop-onebot11-tools \
+scp -r plugins/octop-onebot11 plugins/octop-onebot11-tools plugins/octop-onebot11-skills \
   user@host:/opt/octop/data/uploads/
 
 # 容器内安装并重启
 docker exec octop octop plugin install /data/.octop/uploads/octop-onebot11 --force
 docker exec octop octop plugin install /data/.octop/uploads/octop-onebot11-tools --force
+docker exec octop octop plugin install /data/.octop/uploads/octop-onebot11-skills --force
 docker restart octop
 ```
 
-`deploy/install.sh` 支持 Docker / Compose / systemd 三种形态，可远程执行；也可以直接按上面的命令手动安装。
+`deploy/install.sh` 支持 Docker / Compose / systemd 三种形态，可远程执行；安装通道插件后默认自动执行 `scripts/patch_dashboard.py`，把连接方式/回复策略字段渲染成中文下拉并按连接方式联动显隐（`--no-dashboard-patch` 跳过）。也可以直接按上面的命令手动安装。
 
 > `octop plugin install` 只写磁盘。安装或升级后必须重启 Octop，运行中的 Gateway 才会加载新插件。
 
@@ -150,13 +157,19 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | `token` | password | 空 | 正向发给 NapCat 校验；反向校验 NapCat 携带的 token |
 | `listen_host` / `listen_port` / `listen_path` | text/number/text | `0.0.0.0` / `3002` / `/onebot/v11/ws` | 反向监听参数 |
 | `self_id` | text | 空 | 机器人 QQ，留空自动获取 |
-| `group_reply_mode` | select | `mention` | `mention` / `always` / `off` |
+| `group_reply_mode` | select | `mention` | `mention` / `auto` / `always` / `off`；`auto` 为自主参与（见回复策略） |
 | `trigger_keywords` | text | 空 | 逗号分隔，命中后群聊无需 @ |
 | `private_reply_mode` | select | `always` | `always` / `keyword` / `off` |
-| `group_history_limit` | number | `10` | 回复时携带的群上下文条数 |
+| `group_history_limit` | number | `10` | 回复时携带的群上下文条数（设为 0 即只看当前消息，需要背景时 Agent 自己查记录） |
 | `reply_with_quote` | switch | `false` | 回复是否引用原消息 |
+| `sender_label_with_id` | switch | `true` | 消息标注为「昵称(QQ号)」，QQ 号是用户唯一标识 |
+| `message_time_prefix` | switch | `true` | 每条消息前缀 `[MM-DD HH:MM]` 时间戳 |
 | `allowed_groups` / `allowed_users` | text | 空 | 群 / 私聊白名单，逗号分隔 |
 | `allowed_senders` / `blocked_senders` | text | 空 | 发送人白名单 / 黑名单（黑名单优先） |
+| `admin_users` | text | 空 | 允许通过 Agent 触发群管理工具（禁言/改名片/撤回他人消息）的 QQ 号，逗号分隔 |
+| `history_enabled` | switch | `true` | 聊天记录持久化（本地 SQLite，供 Agent 按需查询） |
+| `media_fetch_enabled` | switch | `true` | 入站图片下载后交给多模态模型、语音转文字 |
+| `asr_base_url` | text | 空 | OpenAI 兼容语音转写服务地址；留空则用 NapCat 自带转写 |
 | `outbox_enabled` | switch | `true` | 断线时主动消息进入队列，重连后补发 |
 | `media_allowed_dirs` | text | 空 | 允许主动发送读取的本地媒体目录 |
 | `multi_account` | switch | `false` | 反向模式允许接入多个 QQ |
@@ -173,7 +186,15 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | `ignore_self_message` | `true` | 忽略机器人自己发出的消息 |
 | `max_text_chars` | `1500` | 单条文本上限，超长自动分片 |
 | `group_history_ttl_seconds` | `300` | 群上下文缓存有效期 |
+| `display_timezone` | `Asia/Shanghai` | 消息时间戳与记录查询使用的时区（IANA 名称） |
+| `history_dir` / `history_retention_days` / `history_max_rows_per_chat` | 空 / `30` / `20000` | 记录库位置（默认 `~/.octop/onebot11/history`）、保留天数、每会话行数上限 |
+| `media_max_mb` / `media_timeout_seconds` / `media_allowed_hosts` | `8` / `20` / 空 | 入站媒体的大小上限、下载超时、额外信任的主机（默认仅 QQ 官方域名与 NapCat 自身） |
+| `asr_api_key` / `asr_model` / `asr_language` | 空 / `whisper-1` / `zh` | 外部转写服务的密钥、模型、语言 |
+| `asr_napcat_fallback` | `true` | 外部转写未配置或失败时，用 NapCat 自带的语音转文字兜底 |
+| `auto_reply_threshold` | `0.6` | 自主参与阈值，越小越积极（0.3 很积极，1.0 基本只在明确求助时出声） |
+| `auto_reply_cooldown_seconds` / `auto_reply_max_per_hour` | `120` / `6` | 自主参与的每群冷却与每小时上限 |
 | `send_rate_limit_count` / `send_rate_limit_window` | `20` / `60` | 发送限速（条数 / 秒），`0` 关闭 |
+| `send_rate_limit_per_chat_count` | `0` | 每会话限速（滑动窗口，`0` 关闭），降低单群刷屏风控风险 |
 | `outbox_max_items` / `outbox_ttl_seconds` / `outbox_max_attempts` | `100` / `3600` / `3` | 队列容量、有效期、单条最大尝试次数 |
 | `outbox_retry_min_seconds` / `outbox_retry_max_seconds` | `2` / `60` | 失败重试的指数退避区间 |
 | `outbox_persist` / `outbox_persist_dir` | `true` / 空 | 队列落盘，默认 `~/.octop/onebot11/state` |
@@ -192,6 +213,7 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | 场景 | 配置 | 模型调用 |
 |---|---|---|
 | 群聊仅 @ 或关键词 | `group_reply_mode=mention` + `trigger_keywords` | 命中时 1 轮 |
+| 群聊自主参与 | `group_reply_mode=auto` + `auto_reply_*` | 被提问/求助的消息才触发，受冷却与每小时上限约束 |
 | 群聊全部回复 | `group_reply_mode=always` | 每条群消息 |
 | 群聊不回复 | `group_reply_mode=off` | 0 |
 | 私聊全部回复 | `private_reply_mode=always` | 每条私聊 |
@@ -200,11 +222,24 @@ octop channel create --agent <agent_id> --kind onebot11 --name "QQ (NapCat 反�
 | 定时纯文本推送 | cron `task_type=text` | 0 |
 | 定时生成内容 | cron `task_type=agent` | 每次 1 轮 |
 
-非触发的群消息只进入短期上下文缓存（默认 10 条 / 300 秒），触发时作为上下文使用。
+非触发的群消息仍进入短期上下文缓存（默认 10 条 / 300 秒），同时全量落入持久记录库——把 `group_history_limit` 降为 0 也不损失可查性，需要背景时 Agent 自己查询。
 
-### 主动发送
+### Agent 工具
 
-Agent 通过工具插件发送，不需要该群此前有会话：
+`octop-onebot11-tools` 注册 13 个工具；`octop-onebot11-skills` 里有面向 Agent 的完整用法说明。
+
+| 工具 | 作用 |
+|---|---|
+| `onebot11_send_group` / `onebot11_send_private` | 发送文本/图片/语音/@/引用到群或私聊，返回 `message_id` 回执 |
+| `onebot11_send_forward_group` | 群合并转发 |
+| `onebot11_send_voice` | 发送语音条（本地文件或 URL） |
+| `onebot11_query_history` / `onebot11_history_overview` | 按时间/关键词/QQ 号查询聊天记录；先看会话概览再决定查什么 |
+| `onebot11_status` | 通道健康：在线、登录、重连、发送成功率、队列 |
+| `onebot11_list_groups` / `onebot11_group_members` | 列出白名单内的群与群成员（不含隐私字段） |
+| `onebot11_react` | 给消息贴表情回应 |
+| `onebot11_recall_message` | 撤回机器人自己发的消息（本地库核对后才执行） |
+| `onebot11_group_admin` | 禁言/解禁/改名片/撤回他人消息，仅 `admin_users` 中的真实发送者可触发 |
+| `onebot11_probe_napcat` | 探测本机 NapCat（仅管理端） |
 
 ```python
 onebot11_send_group(group_id="123456789", text="构建完成，产物已上传")
@@ -229,8 +264,21 @@ onebot11_send_forward_group(
 ```
 
 - 断线时：配置了 `http_api_url` 则改走 HTTP；否则进入待发队列，重连后补发。
+- 发送成功返回 `message_id`；超时区分「未发出」与「已发出未确认」，不会盲目重发。
 - 返回值以 `发送失败:` 开头表示未成功，不会静默丢弃。
 - 多通道部署时，请在 Agent 的工具配置里绑定 `channel_id`，否则工具无法确定用哪个通道。
+
+### 查询聊天记录
+
+```python
+# 昨天 10001 在群里说了什么
+onebot11_query_history(chat_id="123456789", sender="10001", hours=24)
+
+# 检索关键词
+onebot11_query_history(chat_id="123456789", keyword="发布", hours=72)
+```
+
+记录按「昵称(QQ号) + 时间 + 内容」存储，昵称改了也能通过 QQ 号跨会话追踪同一人；查询结果只包含数据，不会被当成指令执行。
 
 ### 定时任务
 
@@ -266,8 +314,13 @@ onebot11_send_forward_group(
 | `NapCat 未登录，等待登录` | QQ 未扫码 | 在 NapCat WebUI 登录，无需重建通道 |
 | `反向模式未配置 token，已拒绝监听` | 非本机监听且无 token | 配置 `token`，或显式开启 `reverse_allow_no_token` |
 | 群消息不触发 | 未 @ 且未命中关键词 | 检查 `group_reply_mode` 与 `trigger_keywords` |
+| 自主参与不触发 | 消息得分未到阈值，或在冷却/上限内 | 调低 `auto_reply_threshold`，检查冷却与每小时上限 |
+| 图片/语音没被理解 | 媒体抓取被关、超限或域名不可信 | 检查 `media_fetch_enabled` / `media_max_mb` / `media_allowed_hosts`；跨机部署时在 NapCat 打开 `enableLocalFile2Url` |
+| 语音转写失败 | NapCat 无 ffmpeg 或消息已不在缓存 | 配置外部 `asr_base_url`，详见 [NapCat 能力文档](docs/napcat-capabilities.md) |
 | `发送失败: 存在 N 个 OneBot 11 通道` | 多通道且未绑定 | 在 Agent 工具配置中填写 `channel_id` |
 | `发送失败: 本地文件路径发送未启用` | 未授权本地媒体目录 | 改用 http(s) 地址，或配置 `media_allowed_dirs` |
+| 群管理工具被拒绝 | 触发者不在 `admin_users`，或消息不属于该会话 | 身份只认 NapCat 事件里的 QQ 号；把使用者加进 `admin_users` |
+| Dashboard 字段显示为文本框 | 未打 Dashboard 补丁 | 跑 `scripts/patch_dashboard.py`（install.sh 默认已自动执行），然后硬刷新页面 |
 | 修改配置后不生效 | CLI 只写数据库 | 重启 Octop，或用 `scripts/patch_channel.py` 的 HTTP 模式 |
 | `channel test` 返回 ok 但没连上 | 该命令只验证配置与生命周期 | 真实状态看 Dashboard 或日志 |
 
@@ -284,6 +337,7 @@ onebot11_send_forward_group(
 | 文档 | 内容 |
 |---|---|
 | [docs/napcat.md](docs/napcat.md) | NapCat 部署与正反向配置 |
+| [docs/napcat-capabilities.md](docs/napcat-capabilities.md) | NapCat / OneBot 11 能力全集与通道差距（扩展 Agent 能力前先看） |
 | [docs/design.md](docs/design.md) | 实现机制、消息映射、故障排查 |
 | [docs/development.md](docs/development.md) | 开发环境、代码地图、开发约定 |
 | [ROADMAP.md](ROADMAP.md) | 开发计划（独立文档） |

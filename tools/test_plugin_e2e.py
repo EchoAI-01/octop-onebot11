@@ -35,6 +35,9 @@ import websockets
 _SCRATCH = tempfile.mkdtemp(prefix="ob11-e2e-")
 tempfile.tempdir = _SCRATCH
 atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
+# The plugin keeps its default state (history, outbox) under ~/.octop; point
+# "home" at the scratch directory so a test run never touches the real one.
+os.environ["HOME"] = os.environ["USERPROFILE"] = _SCRATCH
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -263,6 +266,7 @@ async def scenario_logged_in(plugin, log_path: Path):
             ws_url=f"ws://127.0.0.1:{PORT}",
             token="dev-token",
             group_reply_mode="mention",
+            history_dir=tempfile.mkdtemp(),
         )
         channel = plugin.OneBot11Channel(lambda _m: None, config=cfg, channel_id="e2e", tenant_id="Eous")
         await channel.start()
@@ -276,6 +280,9 @@ async def scenario_logged_in(plugin, log_path: Path):
         assert message.channel_subject.subject_id == "group:20002"
         assert message.metadata["bot_mentioned"] is True
         assert "离线联调测试消息" in message.text
+        # R10: the QQ number is part of the label, the model sees a clock time.
+        assert message.metadata["sender_name"] == "测试用户(10001)", message.metadata["sender_name"]
+        assert message.text.startswith("["), message.text
 
         await channel._send_text(message.channel_subject, "收到，通道正常。")
 
@@ -308,6 +315,15 @@ async def scenario_logged_in(plugin, log_path: Path):
         assert "https://example.com/a.png" in log, log[-2000:]
         assert "富媒体主动消息" in log, log[-2000:]
         assert "send_private_msg" not in log, log[-2000:]
+
+        # R10: both sides of the conversation are in the durable history.
+        store = channel.history_store()
+        rows = store.query(channel_id="e2e", chat_type="group", chat_id="20002", limit=50)
+        incoming = [r for r in rows if r.direction == "in"]
+        outgoing = [r for r in rows if r.direction == "out"]
+        assert incoming and incoming[0].sender_id == "10001" and "离线联调测试消息" in incoming[0].text, rows
+        assert any("收到，通道正常。" in r.text for r in outgoing), [r.text for r in outgoing]
+        assert all(r.message_id for r in outgoing), "the mock acknowledges every send with a message_id"
 
         await channel.stop()
         print("logged-in scenario passed")

@@ -17,9 +17,12 @@ Design goals
 * One WebSocket connection carries both directions: inbound events arrive as
   JSON objects with ``post_type`` and outbound actions are JSON objects with
   ``action`` / ``params`` / ``echo``.  Responses are correlated by ``echo``.
-* The channel is deliberately self-contained (single file, stdlib + the
-  ``websockets`` package already shipped with Octop) so it can be installed as
-  a regular ``kind: channel`` plugin without patching Octop core.
+* The channel needs nothing beyond what Octop already ships (``websockets``,
+  ``aiohttp``, stdlib ``sqlite3``) so it installs as a regular
+  ``kind: channel`` plugin without patching Octop core.  The code is split
+  into this file (transport, policy, Octop contract) and three sibling
+  modules: ``history`` (durable chat store), ``autoreply`` (participation
+  gate) and ``media`` (inbound image / voice handling).
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
+import hashlib
 import hmac
 import http
 import json
@@ -35,7 +40,9 @@ import math
 import os
 import random
 import re
+import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import urllib.error
@@ -64,6 +71,48 @@ from octop_gateway.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_sibling(name: str) -> Any:
+    """Import a module that sits next to this file.
+
+    Octop's loader gives the entry module a package context (``from . import x``
+    works); a bare ``spec_from_file_location`` load (test fixtures, ad-hoc
+    scripts) does not.  Try the package form first, then fall back to loading
+    the file by path under a private, stable module name.
+    """
+    package = __package__ or ""
+    if package:
+        try:
+            import importlib
+
+            return importlib.import_module(f"{package}.{name}")
+        except ImportError:
+            pass
+    import importlib.util
+
+    key = f"_octop_onebot11_{name}"
+    cached = sys.modules.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    spec = importlib.util.spec_from_file_location(key, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
+    return module
+
+
+history_mod = _load_sibling("history")
+autoreply_mod = _load_sibling("autoreply")
+media_mod = _load_sibling("media")
+probe_mod = _load_sibling("probe")
 
 # Live channel instances, keyed by Octop channel_id.  Used by the companion
 # `octop-onebot11-tools` plugin so an agent can proactively target any group,
@@ -133,7 +182,56 @@ _MAX_MEDIA_BYTES = 10 * 1024 * 1024
 # base64 inflates by 4/3; leave a little slack for the ``base64://`` prefix.
 _MAX_BASE64_CHARS = _MAX_MEDIA_BYTES * 4 // 3 + 64
 _MONITOR_BUFFER_CAP = 50
-_MONITOR_SKIP_TEXTS = frozenset({"〔巡检跳过〕", "巡检跳过"})
+# Conversations whose per-chat send window is remembered (oldest are forgotten first).
+_CHAT_RATE_TRACK_CAP = 512
+# How long after an autonomous engagement a "nothing to add" reply is still honoured.
+# The core overwrites ``subject.metadata`` with every later (passive) message, so the
+# per-message ``auto_engaged`` flag may be gone by the time the agent answers.
+_AUTO_SKIP_WINDOW = 600.0
+_AUTO_TRACK_CAP = 256
+# Placeholders of media still to be resolved, per message (see ``_preprocess_inbound``).
+_MEDIA_REF_CAP = 128
+# At most this many images / voice notes are resolved per message.
+_MEDIA_MAX_IMAGES = 4
+_MEDIA_MAX_VOICES = 2
+_VOICE_TRANSCRIPT_PREFIX = "[语音消息·自动转写，可能有误] "
+# NapCat's fetch_ptt_text runs three steps (look the message up, transcribe, look it up again),
+# each allowed its configured baseTimeout (10 s by default).
+_PTT_TEXT_TIMEOUT = 30.0
+_PTT_TEXT_MAX_CHARS = 2000
+# Actions the agent tools may drive besides sending messages.  Anything else
+# (restart, cache cleaning, quick operations, file management ...) stays out of
+# reach of a model-controlled string.
+_TOOL_READ_ACTIONS = frozenset({"get_group_list", "get_group_info", "get_group_member_list"})
+_TOOL_WRITE_ACTIONS = frozenset({"delete_msg", "set_group_ban", "set_group_card", "set_msg_emoji_like"})
+_TOOL_ACTIONS = _TOOL_READ_ACTIONS | _TOOL_WRITE_ACTIONS
+
+
+@dataclass(frozen=True)
+class Requester:
+    """Who sent the message the agent is answering right now (from the event, not the text)."""
+
+    channel_id: str
+    chat_type: str  # group | private
+    chat_id: str
+    sender_id: str
+    message_id: str
+    self_id: str = ""  # the bot account that received the message
+
+
+_REQUESTER: contextvars.ContextVar[Requester | None] = contextvars.ContextVar("onebot11_requester", default=None)
+
+
+def current_requester() -> Requester | None:
+    """The sender behind the running agent turn (None outside an inbound turn)."""
+    return _REQUESTER.get()
+# Replies that mean "nothing to add": dropped instead of being sent to the group.
+_SKIP_REPLY_TEXTS = frozenset({"〔巡检跳过〕", "巡检跳过", "〔不参与〕", "不参与"})
+_AUTO_REPLY_HINT = (
+    "〔自主参与〕这条群消息不是发给你的，是你看到话题后自行判断要不要插话。"
+    "只有确实能给出有用的回答或补充时才回复；否则请只回复「〔不参与〕」，不要解释。"
+    "需要群里的前文时可调用 onebot11_query_history。"
+)
 # Per-connection inbound event backlog (events are handled by a worker task so
 # the read loop never waits on an API round trip).
 _EVENT_QUEUE_MAX = 1000
@@ -319,6 +417,13 @@ _CHOICE_ALIASES: dict[str, dict[str, str]] = {
         "不回复群聊": "off",
         "关闭": "off",
         "禁用": "off",
+        "auto": "auto",
+        "smart": "auto",
+        "自主": "auto",
+        "自主参与": "auto",
+        "智能": "auto",
+        "智能参与": "auto",
+        "自主参与（按内容判断是否插话）": "auto",
     },
     "private_reply_mode": {
         "always": "always",
@@ -361,6 +466,21 @@ def _normalize_choice(value: Any, field_name: str, default: str) -> str:
     return canonical
 
 
+class SendQuotaError(RuntimeError):
+    """A send was refused because the per-chat quota (Q-07) is used up."""
+
+    def __init__(self, label: str, limit: int, window: float, wait: float, count: int = 1) -> None:
+        self.wait_seconds = wait
+        if count > limit:
+            message = f"一次要发 {count} 条消息，超过{label}的发送配额（每 {window:g} 秒最多 {limit} 条），请精简内容"
+        else:
+            message = (
+                f"发往{label}的消息过于频繁：每 {window:g} 秒最多 {limit} 条，"
+                f"请约 {max(1, math.ceil(wait))} 秒后再试"
+            )
+        super().__init__(message)
+
+
 class OneBotAPIError(RuntimeError):
     """A OneBot action returned ``status=failed`` or a non-zero retcode."""
 
@@ -369,6 +489,74 @@ class OneBotAPIError(RuntimeError):
         self.retcode = retcode
         self.message = message
         super().__init__(f"OneBot {action} failed (retcode={retcode}): {message}")
+
+
+@dataclass
+class PushReceipt:
+    """What a proactive send actually achieved (Q-03 delivery receipt).
+
+    ``message_ids`` are the ids NapCat returned for messages it acknowledged,
+    in send order.  ``queued`` messages sit in the retry outbox; when
+    ``unconfirmed`` is set the first of them was already written to the socket
+    and only its acknowledgement is missing, so it may well be delivered.
+    """
+
+    message_ids: list[str] = field(default_factory=list)
+    sent: int = 0
+    queued: int = 0
+    unconfirmed: bool = False
+
+    def describe(self) -> str:
+        """One-line status for people and agents ('' when everything was acknowledged)."""
+        parts: list[str] = []
+        if self.sent and self.queued:
+            parts.append(f"{self.sent} 条已确认送达")
+        waiting = self.queued
+        if self.unconfirmed and waiting:
+            parts.append("1 条已发出但未收到 NapCat 确认（可能已送达；重试次数有限，请勿手动重复发送）")
+            waiting -= 1
+        if waiting > 0:
+            parts.append(f"{waiting} 条尚未发出，已进入待发队列，重连后自动补发")
+        return "；".join(parts)
+
+
+@dataclass
+class _Stats:
+    """Process-lifetime counters behind :meth:`OneBot11Channel.stats` (Q-04)."""
+
+    started_at: float = field(default_factory=time.time)
+    connections: int = 0
+    disconnects: int = 0
+    last_connect_at: float = 0.0
+    last_disconnect_at: float = 0.0
+    inbound_messages: int = 0
+    send_ok: int = 0
+    send_rejected: int = 0  # NapCat answered with a failure
+    send_unconfirmed: int = 0  # written to the socket, no answer in time
+    send_transport_errors: int = 0  # nothing could be written
+    last_send_error: str = ""
+    last_send_error_at: float = 0.0
+    outbox_parked: int = 0
+    outbox_delivered: int = 0
+    outbox_dropped: int = 0
+    throttled_sends: int = 0
+    auto_engaged: int = 0  # unaddressed messages handed to the agent (auto mode)
+    auto_declined: int = 0  # ... of which the agent chose to stay silent
+    tool_actions: int = 0  # allow-listed actions run on behalf of agent tools
+    media_images_fetched: int = 0
+    media_images_failed: int = 0
+    voice_transcribed: int = 0
+    voice_transcribed_napcat: int = 0  # ... of which by NapCat's own speech-to-text
+    voice_failed: int = 0
+
+
+@dataclass
+class _MediaRef:
+    """A media segment of a parsed message that still has to be resolved (R11)."""
+
+    kind: str  # image | record
+    part: Any  # the placeholder content part (identity-matched in message.content)
+    data: dict[str, Any]  # the segment's ``data`` dict (file / url / summary ...)
 
 
 @dataclass
@@ -449,7 +637,7 @@ class OneBot11Config(ChannelConfig):
     # this explicit (insecure) opt-in is set.
     reverse_allow_no_token: bool = False
     self_id: str = ""
-    group_reply_mode: str = "mention"  # mention | always | off
+    group_reply_mode: str = "mention"  # mention | auto | always | off
     private_reply_mode: str = "always"  # always | keyword | off
     trigger_keywords: str = ""
     keyword_case_sensitive: bool = False
@@ -466,8 +654,12 @@ class OneBot11Config(ChannelConfig):
     # Outbound policy: empty whitelist entries mean "no restriction".
     allowed_groups: str = ""
     allowed_users: str = ""
+    # Two-level send quota: ``send_rate_limit_count`` caps the whole channel,
+    # ``send_rate_limit_per_chat_count`` (0 = off) caps each group / user, both
+    # per ``send_rate_limit_window`` seconds.
     send_rate_limit_count: int = 20
     send_rate_limit_window: float = 60.0
+    send_rate_limit_per_chat_count: int = 0
     # In-memory outbox for proactive (strict) sends while disconnected.
     outbox_enabled: bool = True
     outbox_max_items: int = 100
@@ -486,6 +678,9 @@ class OneBot11Config(ChannelConfig):
     # Inbound sender policy: empty means no restriction; blacklist wins.
     allowed_senders: str = ""
     blocked_senders: str = ""
+    # QQ numbers allowed to order administrative actions (mute / title card) through
+    # the agent tools; empty = nobody, so a stranger can never talk the bot into it.
+    admin_users: str = ""
     # Event handling.
     poke_triggers_reply: bool = False
     auto_accept_friend_request: bool = False
@@ -495,6 +690,12 @@ class OneBot11Config(ChannelConfig):
     http_api_url: str = ""
     http_api_token: str = ""
     http_api_timeout_seconds: float = 10.0
+    # Autonomous participation (group_reply_mode = auto): messages that were not
+    # addressed to the bot are scored; only those at or above the threshold,
+    # within the cooldown / hourly budget, are handed to the agent.
+    auto_reply_threshold: float = 0.6
+    auto_reply_cooldown_seconds: float = 120.0
+    auto_reply_max_per_hour: int = 6
     # Group monitor: periodic digest of non-triggering group messages.
     monitor_enabled: bool = False
     monitor_interval_seconds: float = 600.0
@@ -502,6 +703,36 @@ class OneBot11Config(ChannelConfig):
     monitor_keywords: str = ""
     monitor_min_trigger_gap_seconds: float = 1800.0
     monitor_max_per_hour: int = 4
+    # Durable chat history (R10): every accepted message is stored so the agent
+    # can look things up on demand instead of being fed a fixed window.
+    history_enabled: bool = True
+    history_dir: str = ""  # empty -> ~/.octop/onebot11/history
+    history_retention_days: float = 30.0
+    history_max_rows_per_chat: int = 20000
+    # Label prompt lines as ``nickname(QQ)`` with a clock time; the nickname is
+    # display only, the QQ number is the identity.
+    sender_label_with_id: bool = True
+    # Prefix every inbound message text with ``[MM-DD HH:MM]`` so the model can
+    # judge when things were said (the core renders no time of its own).
+    message_time_prefix: bool = True
+    # IANA zone for those clock times and for the history tool ("" = server local).
+    display_timezone: str = "Asia/Shanghai"
+    # Inbound media (R11).  Images are downloaded by the plugin (with a proper
+    # User-Agent and a NapCat ``get_image`` fallback) so the model receives the
+    # pixels instead of a URL that may have expired; voice notes are sent to an
+    # OpenAI-compatible speech-to-text endpoint when ``asr_base_url`` is set.
+    media_fetch_enabled: bool = True
+    media_max_mb: float = 8.0
+    media_timeout_seconds: float = 20.0
+    media_allowed_hosts: str = ""  # extra trusted hosts, comma separated
+    asr_base_url: str = ""
+    asr_api_key: str = ""
+    asr_model: str = "whisper-1"
+    asr_language: str = "zh"
+    # NapCat can transcribe a voice note itself (``fetch_ptt_text``, QQ's own
+    # speech-to-text): used when no external service is set, or as a second
+    # chance when the external one fails.
+    asr_napcat_fallback: bool = True
     group_context: GroupContextConfig = field(
         default_factory=lambda: GroupContextConfig(
             enabled=True,
@@ -593,11 +824,47 @@ class OneBot11Config(ChannelConfig):
         self.monitor_max_per_hour = max(
             1, _to_int(self.monitor_max_per_hour, 4, name="monitor_max_per_hour")
         )
+        self.auto_reply_threshold = min(
+            2.0, max(0.1, _to_float(self.auto_reply_threshold, 0.6, name="auto_reply_threshold"))
+        )
+        self.auto_reply_cooldown_seconds = max(
+            0.0, _to_float(self.auto_reply_cooldown_seconds, 120.0, name="auto_reply_cooldown_seconds")
+        )
+        self.auto_reply_max_per_hour = max(
+            1, _to_int(self.auto_reply_max_per_hour, 6, name="auto_reply_max_per_hour")
+        )
+        self.history_enabled = _to_bool(self.history_enabled)
+        self.history_dir = str(self.history_dir or "").strip()
+        self.history_retention_days = max(
+            0.0, _to_float(self.history_retention_days, 30.0, name="history_retention_days")
+        )
+        self.history_max_rows_per_chat = max(
+            0, _to_int(self.history_max_rows_per_chat, 20000, name="history_max_rows_per_chat")
+        )
+        self.sender_label_with_id = _to_bool(self.sender_label_with_id)
+        self.message_time_prefix = _to_bool(self.message_time_prefix)
+        self.display_timezone = str(self.display_timezone or "").strip()
+        self.media_fetch_enabled = _to_bool(self.media_fetch_enabled)
+        self.media_max_mb = min(50.0, max(0.5, _to_float(self.media_max_mb, 8.0, name="media_max_mb")))
+        self.media_timeout_seconds = min(
+            120.0, max(3.0, _to_float(self.media_timeout_seconds, 20.0, name="media_timeout_seconds"))
+        )
+        self.media_allowed_hosts = str(self.media_allowed_hosts or "").strip()
+        self.admin_users = str(self.admin_users or "").strip()
+        self.asr_base_url = str(self.asr_base_url or "").strip()
+        self.asr_api_key = str(self.asr_api_key or "").strip()
+        self.asr_model = str(self.asr_model or "").strip() or "whisper-1"
+        self.asr_language = str(self.asr_language or "").strip()
+        self.asr_napcat_fallback = _to_bool(self.asr_napcat_fallback)
         self.send_rate_limit_count = max(
             0, _to_int(self.send_rate_limit_count, 20, name="send_rate_limit_count")
         )
         self.send_rate_limit_window = max(
             1.0, _to_float(self.send_rate_limit_window, 60.0, name="send_rate_limit_window")
+        )
+        self.send_rate_limit_per_chat_count = max(
+            0,
+            _to_int(self.send_rate_limit_per_chat_count, 0, name="send_rate_limit_per_chat_count"),
         )
         self.group_history_limit = max(
             0, _to_int(self.group_history_limit, 10, name="group_history_limit")
@@ -699,6 +966,20 @@ class OneBot11Channel(BaseChannel):
         self._reject_window: tuple[float, int] = (0.0, 0)
         self._media_dirs = self._resolve_media_dirs(config.media_allowed_dirs)
         self._backoff = max(0.5, float(config.reconnect_min_seconds))
+        self._history: Any = None
+        self._history_tz: Any = None
+        self._history_tz_ready = False
+        self._stats = _Stats()
+        self._chat_sends: OrderedDict[str, deque[float]] = OrderedDict()
+        self._auto_engaged_at: OrderedDict[str, float] = OrderedDict()
+        self._media_refs: OrderedDict[str, list[_MediaRef]] = OrderedDict()
+        self._media_sem = asyncio.Semaphore(4)
+        self._ptt_text_unsupported = False
+        self._auto_gate = autoreply_mod.AutoReplyGate(
+            threshold=config.auto_reply_threshold,
+            cooldown_seconds=config.auto_reply_cooldown_seconds,
+            max_per_hour=config.auto_reply_max_per_hour,
+        )
         if self.channel_id != "__probe__":
             _LIVE_CHANNELS[self.channel_id] = self
 
@@ -726,6 +1007,57 @@ class OneBot11Channel(BaseChannel):
     @property
     def runtime_error(self) -> str | None:
         return self._runtime_error
+
+    def stats(self) -> dict[str, Any]:
+        """Health snapshot for operators and the status tool (Q-04). Cheap, no I/O."""
+        s = self._stats
+        now = time.time()
+        attempts = s.send_ok + s.send_rejected + s.send_unconfirmed + s.send_transport_errors
+        mono = time.monotonic()
+        oldest = max((mono - item.queued_at for item in self._outbox), default=0.0)
+        return {
+            "connected": self.is_connected,
+            "runtime_error": self._runtime_error,
+            "mode": "reverse" if self._config.is_reverse else "forward",
+            "self_id": self._self_id,
+            "accounts": sorted({sess.self_id for sess in self._sessions.values() if sess.self_id}),
+            "uptime_seconds": round(max(0.0, now - s.started_at), 1),
+            "connections": s.connections,
+            "reconnects": max(0, s.connections - 1),
+            "disconnects": s.disconnects,
+            "last_connect_at": s.last_connect_at,
+            "last_disconnect_at": s.last_disconnect_at,
+            "inbound_messages": s.inbound_messages,
+            "send_ok": s.send_ok,
+            "send_rejected": s.send_rejected,
+            "send_unconfirmed": s.send_unconfirmed,
+            "send_transport_errors": s.send_transport_errors,
+            "send_success_rate": round(s.send_ok / attempts, 4) if attempts else None,
+            "last_send_error": s.last_send_error,
+            "last_send_error_at": s.last_send_error_at,
+            "throttled_sends": s.throttled_sends,
+            "outbox_queued": len(self._outbox),
+            "outbox_oldest_age_seconds": round(oldest, 1),
+            "outbox_limit": int(self._config.outbox_max_items),
+            "outbox_parked_total": s.outbox_parked,
+            "outbox_delivered_total": s.outbox_delivered,
+            "outbox_dropped_total": s.outbox_dropped,
+            "history_enabled": bool(self._config.history_enabled),
+            "auto_engaged": s.auto_engaged,
+            "auto_declined": s.auto_declined,
+            "tool_actions": s.tool_actions,
+            "media_images_fetched": s.media_images_fetched,
+            "media_images_failed": s.media_images_failed,
+            "voice_transcribed": s.voice_transcribed,
+            "voice_transcribed_napcat": s.voice_transcribed_napcat,
+            "voice_failed": s.voice_failed,
+            "asr_configured": self._asr_config() is not None,
+            "asr_napcat_fallback": bool(self._config.asr_napcat_fallback),
+            "group_reply_mode": self._config.group_reply_mode,
+            "per_chat_quota": int(self._config.send_rate_limit_per_chat_count),
+            "channel_quota": int(self._config.send_rate_limit_count),
+            "quota_window_seconds": float(self._config.send_rate_limit_window),
+        }
 
     def _parse_keywords(self, raw: Any) -> tuple[str, ...]:
         if isinstance(raw, (list, tuple, set)):
@@ -788,6 +1120,156 @@ class OneBot11Channel(BaseChannel):
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # Durable chat history (R10)
+    # ------------------------------------------------------------------
+
+    def display_tz(self) -> Any:
+        """Zone used for clock times in prompts and history output (cached)."""
+        if not self._history_tz_ready:
+            self._history_tz = history_mod.resolve_timezone(self._config.display_timezone)
+            self._history_tz_ready = True
+        return self._history_tz
+
+    def history_denial(self, chat_type: str, chat_id: str) -> str | None:
+        """Why the agent may not read this conversation's history (None = allowed)."""
+        return self.chat_denial(chat_type, chat_id)
+
+    def chat_denial(self, chat_type: str, chat_id: str) -> str | None:
+        """Why agent tools may not touch this conversation (None = allowed).
+
+        Reading and acting follow the same scope as sending: a group or user
+        outside the configured whitelists is off limits.
+        """
+        chat_id = str(chat_id or "").strip()
+        if chat_type == "group" and self._allowed_groups and chat_id not in self._allowed_groups:
+            return f"群 {chat_id} 不在 allowed_groups 白名单"
+        if chat_type != "group" and self._allowed_users and chat_id not in self._allowed_users:
+            return f"用户 {chat_id} 不在 allowed_users 白名单"
+        return None
+
+    def history_path(self) -> str:
+        if not self._config.history_enabled or self.channel_id == "__probe__":
+            return ""
+        base = self._config.history_dir or os.path.join(
+            os.path.expanduser("~"), ".octop", "onebot11", "history"
+        )
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.channel_id)) or "channel"
+        return os.path.join(base, f"{safe}.db")
+
+    def history_store(self) -> Any:
+        """The channel's message store, opened on first use (None when disabled/unusable)."""
+        if self._history is not None and not self._history.closed:
+            return self._history
+        path = self.history_path()
+        if not path:
+            return None
+        try:
+            self._history = history_mod.GroupHistoryStore(
+                path,
+                retention_days=self._config.history_retention_days,
+                max_rows_per_chat=self._config.history_max_rows_per_chat,
+            )
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            # History is an add-on: a read-only disk or a newer schema must not
+            # take the channel down with it.
+            logger.warning("OneBot11 history disabled (%s): %s", path, exc)
+            self._history = None
+            self._config.history_enabled = False
+            return None
+        return self._history
+
+    def _history_close(self) -> None:
+        store, self._history = self._history, None
+        if store is not None:
+            with contextlib.suppress(Exception):
+                store.close()
+
+    async def _history_record_inbound(self, payload: dict[str, Any]) -> None:
+        """Persist one accepted message (best-effort; never blocks or fails the event)."""
+        if not self._config.history_enabled or payload.get("_octop_monitor") or payload.get("_octop_poke"):
+            return
+        try:
+            entry = self._history_entry(payload)
+            if entry is None:
+                return
+            store = self.history_store()
+            if store is None:
+                return
+            await asyncio.to_thread(store.record, **entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - history must never break message handling
+            logger.warning("OneBot11 history record failed: %s", exc)
+
+    @staticmethod
+    def _history_media_item(seg_type: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Compact descriptor of one media segment (never the payload itself)."""
+        file_ref = str(data.get("file_id") or data.get("file") or "")
+        if file_ref.startswith("base64://"):
+            file_ref = ""  # inline bytes are not an identifier worth keeping
+        return {
+            "type": seg_type,
+            "file": file_ref,
+            "name": data.get("name") or "",
+            "url": data.get("url") or "",
+            "summary": data.get("summary") or "",
+            "size": data.get("file_size") or data.get("size") or "",
+        }
+
+    def _history_entry(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        message_type = payload.get("message_type")
+        if message_type not in ("private", "group"):
+            return None
+        user_id = str(payload.get("user_id") or "")
+        is_group = message_type == "group"
+        chat_id = str(payload.get("group_id") or "") if is_group else user_id
+        if not chat_id:
+            return None
+        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+        message = payload.get("message")
+        if isinstance(message, str):
+            segments = self._parse_cq_string(message)
+        elif isinstance(message, list):
+            segments = [seg for seg in message if isinstance(seg, dict)]
+        else:
+            segments = []
+        text_parts: list[str] = []
+        media: list[dict[str, Any]] = []
+        reply_to = ""
+        for seg in segments:
+            seg_type = str(seg.get("type") or "")
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            if seg_type == "text":
+                text_parts.append(str(data.get("text") or ""))
+            elif seg_type == "at":
+                text_parts.append(f"@{data.get('name') or data.get('qq') or ''} ")
+            elif seg_type == "reply":
+                reply_to = str(data.get("id") or "")
+            elif seg_type == "face":
+                text_parts.append("[表情]")
+            elif seg_type in ("image", "record", "video", "file", "forward", "json", "xml"):
+                media.append(self._history_media_item(seg_type, data))
+        try:
+            ts = float(payload.get("time")) if payload.get("time") is not None else time.time()
+        except (TypeError, ValueError):
+            ts = time.time()
+        return {
+            "channel_id": self.channel_id,
+            "self_id": str(payload.get("self_id") or self._self_id or ""),
+            "chat_type": "group" if is_group else "private",
+            "chat_id": chat_id,
+            "message_id": str(payload.get("message_id") or ""),
+            "sender_id": user_id,
+            "sender_name": str(sender.get("card") or sender.get("nickname") or ""),
+            "ts": ts,
+            "text": "".join(text_parts).strip(),
+            "media": media,
+            "mentioned": self._event_triggers(payload),
+            "reply_to": reply_to,
+            "direction": "in",
+        }
+
     def _default_constraints(self) -> ChannelConstraints:
         # Defensive: may be invoked by BaseChannel.__init__ before _config lands.
         config = getattr(self, "_config", None)
@@ -804,7 +1286,7 @@ class OneBot11Channel(BaseChannel):
             show_tool_hints=False,
         )
 
-    async def push_text(self, subject: ChannelSubject, text: str) -> None:
+    async def push_text(self, subject: ChannelSubject, text: str) -> PushReceipt | None:
         """Proactive text send; strict mode queues or raises on real failures.
 
         Octop's internal push paths (cron / proactive care / team) keep the
@@ -815,9 +1297,9 @@ class OneBot11Channel(BaseChannel):
         """
         if not (subject.metadata or {}).get("strict_push"):
             return await super().push_text(subject, text)
-        await self.push_segments(subject, [{"type": "text", "data": {"text": text}}])
+        return await self.push_segments(subject, [{"type": "text", "data": {"text": text}}])
 
-    async def push_segments(self, subject: ChannelSubject, segments: list[dict[str, Any]]) -> None:
+    async def push_segments(self, subject: ChannelSubject, segments: list[dict[str, Any]]) -> PushReceipt:
         """Strict proactive send of mixed OneBot segments (at / image / text).
 
         Long text is split into multiple messages; non-text segments ride on
@@ -825,6 +1307,10 @@ class OneBot11Channel(BaseChannel):
         base64.  When the transport is down (or fails mid-batch) the remaining
         messages are parked in the outbox instead of raising, unless the
         outbox is disabled or full.
+
+        Returns a :class:`PushReceipt`: the ``message_id`` of every message
+        NapCat acknowledged plus how many were left in the retry outbox (and
+        whether the first of those may in fact have been delivered).
         """
         denial = self._send_denial(subject)
         if denial:
@@ -835,31 +1321,62 @@ class OneBot11Channel(BaseChannel):
         cleaned = [seg for seg in segments if isinstance(seg, dict)]
         cleaned = [self._materialize_media_segment(seg) for seg in cleaned]
         cleaned = self._reply_segments_first(cleaned)
+        receipt = PushReceipt()
         chunks = self._compose_push_chunks(cleaned)
         if not chunks:
-            return
+            return receipt
         resolved = self.resolve_push_subject(subject)
         prepared: list[tuple[str, dict[str, Any], str]] = []
         for chunk in chunks:
             action, params = self._build_send_action(resolved, chunk)
             prepared.append((action, {**params, "message": chunk}, account))
+        refusal = self._quota_refusal(self._chat_key(prepared[0][0], prepared[0][1]), len(prepared))
+        if refusal is not None:
+            self._stats.throttled_sends += 1
+            raise refusal
 
         if self._connected_transport or self._http_available():
             await self._acquire_rate_slot()
             for index, (action, params, item_account) in enumerate(prepared):
+                chat_key = self._chat_key(action, params)
+                wait = self._chat_quota_take(chat_key)
+                if wait > 0:
+                    # Someone else used the last slot since the check above: keep
+                    # the rest for the outbox, which respects the quota on replay.
+                    self._stats.throttled_sends += 1
+                    quota = SendQuotaError(
+                        self._chat_label(chat_key),
+                        int(self._config.send_rate_limit_per_chat_count),
+                        float(self._config.send_rate_limit_window),
+                        wait,
+                    )
+                    if self._enqueue_outbox(prepared[index:], cause=quota):
+                        receipt.queued = len(prepared) - index
+                        return receipt
+                    raise quota
                 try:
-                    await self._call_api(action, params, account=item_account)
+                    result = await self._call_api(action, params, account=item_account)
                 except Exception as exc:  # noqa: BLE001 - queue the rest, re-raise only if parking fails
                     # A timeout means "no ack", not "not sent": NapCat may well
                     # have delivered it.  Park it as an already-used attempt so
                     # the retry budget (and not the clock) bounds duplicates.
                     ambiguous = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    if not ambiguous:
+                        self._chat_quota_release(chat_key)
                     if self._enqueue_outbox(prepared[index:], cause=exc, first_ambiguous=ambiguous):
-                        return
+                        receipt.queued = len(prepared) - index
+                        receipt.unconfirmed = ambiguous
+                        return receipt
                     raise
-            return
+                receipt.sent += 1
+                message_id = self._delivered_message_id(result)
+                if message_id:
+                    receipt.message_ids.append(message_id)
+                await self._history_record_outbound(action, params, params["message"], result, item_account)
+            return receipt
         if self._enqueue_outbox(prepared):
-            return
+            receipt.queued = len(prepared)
+            return receipt
         raise ConnectionError("OneBot 11 未连接（NapCat 未登录或 WebSocket 未就绪），且待发队列不可用")
 
     def _http_available(self) -> bool:
@@ -874,7 +1391,7 @@ class OneBot11Channel(BaseChannel):
         rest = [seg for seg in segments if str(seg.get("type") or "") != "reply"]
         return [*replies, *rest]
 
-    async def push_forward(self, subject: ChannelSubject, nodes: list[dict[str, Any]]) -> None:
+    async def push_forward(self, subject: ChannelSubject, nodes: list[dict[str, Any]]) -> PushReceipt:
         """Strict proactive merged-forward send (groups only)."""
         if not isinstance(nodes, list) or not nodes or not all(isinstance(node, dict) for node in nodes):
             raise ValueError("合并转发内容必须是非空节点数组")
@@ -890,8 +1407,45 @@ class OneBot11Channel(BaseChannel):
             raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
         if not self._connected_transport and not self._http_available():
             raise ConnectionError("OneBot 11 未连接（NapCat 未登录或 WebSocket 未就绪）")
+        refusal = self._quota_refusal(self._chat_key(action, params), 1)
+        if refusal is not None:
+            self._stats.throttled_sends += 1
+            raise refusal
         await self._acquire_rate_slot()
-        await self._call_api("send_group_forward_msg", {**params, "messages": nodes}, account=account)
+        self._chat_quota_take(self._chat_key(action, params))
+        result = await self._call_api("send_group_forward_msg", {**params, "messages": nodes}, account=account)
+        receipt = PushReceipt(sent=1)
+        message_id = self._delivered_message_id(result)
+        if message_id:
+            receipt.message_ids.append(message_id)
+        await self._history_record_outbound(
+            "send_group_msg",
+            params,
+            [{"type": "text", "data": {"text": self._forward_nodes_text(nodes)}}],
+            result,
+            account,
+        )
+        return receipt
+
+    @staticmethod
+    def _forward_nodes_text(nodes: list[dict[str, Any]]) -> str:
+        """Readable one-liner of a merged-forward payload, for the history only."""
+        lines: list[str] = []
+        for node in nodes:
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            content = data.get("content")
+            if isinstance(content, list):
+                text = "".join(
+                    str((seg.get("data") or {}).get("text") or "")
+                    for seg in content
+                    if isinstance(seg, dict) and seg.get("type") == "text"
+                )
+            else:
+                text = str(content or "")
+            text = " ".join(text.split())
+            if text:
+                lines.append(f"{data.get('nickname') or data.get('name') or '?'}: {text}")
+        return "[合并转发] " + " / ".join(lines) if lines else "[合并转发]"
 
     def _compose_push_chunks(self, segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         """Split mixed segments into sendable messages (long text chunked)."""
@@ -989,6 +1543,79 @@ class OneBot11Channel(BaseChannel):
             raise ValueError(f"文件不是受支持的图片格式（PNG/JPEG/GIF/WEBP/BMP）: {value}")
         return content
 
+    @staticmethod
+    def _chat_key(action: str, params: dict[str, Any]) -> str:
+        """Quota bucket of a send action: one per group / private peer ('' = not quota-managed)."""
+        if action == "send_group_msg":
+            return f"group:{params.get('group_id')}"
+        if action == "send_private_msg":
+            return f"user:{params.get('user_id')}"
+        return ""
+
+    @staticmethod
+    def _chat_label(key: str) -> str:
+        kind, _, ident = key.partition(":")
+        return f"群 {ident}" if kind == "group" else f"用户 {ident}"
+
+    def _chat_quota_wait(self, key: str, count: int = 1) -> float:
+        """Seconds until ``count`` more messages fit the chat's quota (0.0 = they fit now)."""
+        limit = int(self._config.send_rate_limit_per_chat_count)
+        if limit <= 0 or not key:
+            return 0.0
+        window = float(self._config.send_rate_limit_window)
+        stamps = self._chat_sends.get(key)
+        if not stamps:
+            return 0.0
+        now = time.monotonic()
+        while stamps and now - stamps[0] >= window:
+            stamps.popleft()
+        if not stamps:
+            del self._chat_sends[key]
+            return 0.0
+        overflow = len(stamps) + count - limit
+        if overflow <= 0:
+            return 0.0
+        # The oldest ``overflow`` stamps have to age out first.
+        return max(0.0, window - (now - stamps[min(overflow, len(stamps)) - 1]))
+
+    def _chat_quota_take(self, key: str) -> float:
+        """Reserve one message for ``key``: 0.0 when granted, else seconds to wait."""
+        limit = int(self._config.send_rate_limit_per_chat_count)
+        if limit <= 0 or not key:
+            return 0.0
+        wait = self._chat_quota_wait(key, 1)
+        if wait > 0:
+            return wait
+        stamps = self._chat_sends.get(key)
+        if stamps is None:
+            stamps = self._chat_sends[key] = deque()
+        stamps.append(time.monotonic())
+        self._chat_sends.move_to_end(key)
+        while len(self._chat_sends) > _CHAT_RATE_TRACK_CAP:
+            self._chat_sends.popitem(last=False)
+        return 0.0
+
+    def _chat_quota_release(self, key: str) -> None:
+        """Give back a slot taken for a message that provably never left (not even unconfirmed)."""
+        stamps = self._chat_sends.get(key)
+        if stamps:
+            stamps.pop()
+            if not stamps:
+                del self._chat_sends[key]
+
+    def _quota_refusal(self, key: str, count: int) -> SendQuotaError | None:
+        """The error for a strict push of ``count`` messages, or None when they fit."""
+        limit = int(self._config.send_rate_limit_per_chat_count)
+        if limit <= 0 or not key:
+            return None
+        window = float(self._config.send_rate_limit_window)
+        if count > limit:
+            return SendQuotaError(self._chat_label(key), limit, window, window, count)
+        wait = self._chat_quota_wait(key, count)
+        if wait > 0:
+            return SendQuotaError(self._chat_label(key), limit, window, wait, count)
+        return None
+
     def _send_denial(self, subject: ChannelSubject) -> str | None:
         """Return a human-readable denial reason, or None when allowed."""
         if not self._allowed_groups and not self._allowed_users:
@@ -1000,6 +1627,71 @@ class OneBot11Channel(BaseChannel):
         if action == "send_private_msg" and self._allowed_users and target not in self._allowed_users:
             return f"目标用户 {target} 不在 allowed_users 白名单"
         return None
+
+    def admin_user_ids(self) -> frozenset[str]:
+        """QQ numbers allowed to order administrative actions (may be empty)."""
+        return _split_id_list(self._config.admin_users)
+
+    async def handle_inbound(self, raw_payload: object) -> None:
+        """Core template, plus: forget who the agent was talking to once the turn is over."""
+        try:
+            await super().handle_inbound(raw_payload)
+        finally:
+            _REQUESTER.set(None)
+
+    async def tool_action(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        account: str = "",
+        timeout: float | None = None,
+    ) -> Any:
+        """Run one allow-listed OneBot action for an agent tool and return NapCat's ``data``.
+
+        The channel enforces what no tool should have to: the action must be in
+        the allow-list, the target group must pass ``allowed_groups``, and write
+        actions take a send-rate slot like any other outbound traffic.
+        """
+        if action not in _TOOL_ACTIONS:
+            raise PermissionError(f"不支持的操作: {action}")
+        clean = {str(key): value for key, value in params.items() if isinstance(value, (str, int, float, bool))}
+        for key in ("group_id", "user_id", "message_id"):
+            if key in clean:
+                clean[key] = self._normalize_id(clean[key])
+        group_id = str(clean.get("group_id") or "")
+        if group_id and self._allowed_groups and group_id not in self._allowed_groups:
+            raise PermissionError(f"目标群 {group_id} 不在 allowed_groups 白名单")
+        account = str(account or "").strip() if len(self._sessions) > 1 else ""
+        if account and self._select_session(account) is None:
+            raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
+        if action in _TOOL_WRITE_ACTIONS:
+            await self._acquire_rate_slot()
+            requester = _REQUESTER.get()
+            logger.info(
+                "OneBot11 tool action %s %s (ordered by %s in %s)",
+                action,
+                {k: v for k, v in clean.items() if k != "card"},
+                (requester.sender_id if requester else "operator/none"),
+                (f"{requester.chat_type}:{requester.chat_id}" if requester else "-"),
+            )
+        self._stats.tool_actions += 1
+        result = await self._call_api(action, clean, timeout=timeout, account=account)
+        if action == "get_group_list" and self._allowed_groups and isinstance(result, list):
+            # A group outside allowed_groups must stay invisible to the agent, too.
+            result = [
+                item for item in result if isinstance(item, dict) and str(item.get("group_id")) in self._allowed_groups
+            ]
+        return result
+
+    def is_self(self, user_id: str) -> bool:
+        """True when ``user_id`` is one of the bot accounts this channel is logged in as."""
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+        if user_id == self._self_id:
+            return True
+        return any(sess.self_id == user_id for sess in self._sessions.values())
 
     # ------------------------------------------------------------------
     # Proactive outbox (in-memory; survives NapCat restarts, not Octop restarts)
@@ -1059,6 +1751,7 @@ class OneBot11Channel(BaseChannel):
                     float(self._config.request_timeout_seconds),
                 )
             self._outbox.append(item)
+        self._stats.outbox_parked += len(items)
         logger.info(
             "OneBot11 queued %d message(s) for retry (outbox=%d, cause=%s)",
             len(prepared),
@@ -1110,6 +1803,7 @@ class OneBot11Channel(BaseChannel):
             head = self._outbox[0]
             if ttl and now - head.queued_at > ttl:
                 expired = self._outbox.popleft()
+                self._stats.outbox_dropped += 1
                 changed = True
                 logger.warning(
                     "OneBot11 outbox item expired (ttl=%ss): %s", ttl, expired.action
@@ -1123,6 +1817,7 @@ class OneBot11Channel(BaseChannel):
                 break
             if item.attempts >= int(self._config.outbox_max_attempts):
                 exhausted = self._outbox.popleft()
+                self._stats.outbox_dropped += 1
                 changed = True
                 logger.warning(
                     "OneBot11 outbox item exceeded max attempts (%d): %s",
@@ -1133,9 +1828,17 @@ class OneBot11Channel(BaseChannel):
             # Replayed messages obey the same send-rate limit as live ones;
             # otherwise a reconnect would dump the whole backlog at once.
             await self._acquire_rate_slot()
+            quota_wait = self._chat_quota_take(self._chat_key(item.action, item.params))
+            if quota_wait > 0:
+                # Over this chat's quota: try again later, without spending a
+                # retry attempt (nothing was sent).  Order is preserved.
+                item.next_try = time.monotonic() + quota_wait
+                self._stats.throttled_sends += 1
+                break
             try:
-                await self._call_api(item.action, item.params, account=item.account)
+                result = await self._call_api(item.action, item.params, account=item.account)
             except OneBotAPIError as exc:
+                self._chat_quota_release(self._chat_key(item.action, item.params))
                 self._requeue_failed(item, ambiguous=False)
                 changed = True
                 logger.info(
@@ -1159,11 +1862,16 @@ class OneBot11Channel(BaseChannel):
                 )
                 break
             except (ConnectionError, ConnectionClosed, OSError):
+                self._chat_quota_release(self._chat_key(item.action, item.params))
                 break
             self._outbox.popleft()
+            self._stats.outbox_delivered += 1
             sent += 1
             changed = True
             now = time.monotonic()
+            await self._history_record_outbound(
+                item.action, item.params, item.params.get("message") or [], result, item.account
+            )
         if sent:
             logger.info("OneBot11 outbox delivered %d message(s), %d remaining", sent, len(self._outbox))
         if changed:
@@ -1514,6 +2222,9 @@ class OneBot11Channel(BaseChannel):
         self._login_confirmed = False
         self._self_id = str(self._config.self_id or "").strip()
         self._runtime_error = "已停止"
+        self._history_close()
+        with contextlib.suppress(Exception):
+            await self._close_http()
         _unregister_live_channel(self)
         logger.info("OneBot11Channel stopped (channel_id=%s)", self.channel_id)
 
@@ -1601,6 +2312,7 @@ class OneBot11Channel(BaseChannel):
             self_id=str(self._config.self_id or "").strip(),
         )
         self._sessions[session.key] = session
+        self._note_connected()
         self._runtime_error = "等待 NapCat 就绪"
         self._backoff = max(0.5, float(self._config.reconnect_min_seconds))
         self._refresh_state()
@@ -1899,6 +2611,7 @@ class OneBot11Channel(BaseChannel):
                     other, reason="replaced by a newer connection", close_code=1000
                 )
         self._sessions[session.key] = session
+        self._note_connected()
         self._backoff = max(0.5, float(self._config.reconnect_min_seconds))
         self._runtime_error = "等待 NapCat 就绪"
         logger.info(
@@ -1926,7 +2639,9 @@ class OneBot11Channel(BaseChannel):
         reason: str = "closed",
         close_code: int | None = None,
     ) -> None:
-        self._sessions.pop(session.key, None)
+        if self._sessions.pop(session.key, None) is not None:
+            self._stats.disconnects += 1
+            self._stats.last_disconnect_at = time.time()
         if session.probe_task is not None and not session.probe_task.done():
             session.probe_task.cancel()
         session.probe_task = None
@@ -2235,6 +2950,12 @@ class OneBot11Channel(BaseChannel):
 
         if self._config.resolve_forward and self._has_forward_segment(payload):
             await self._resolve_forward_payload(payload, target)
+        self._stats.inbound_messages += 1
+        # Store before the trigger gate: the point of the history is that
+        # messages which did *not* start an agent turn can still be looked up.
+        await self._history_record_inbound(payload)
+        if message_type == "group" and self._config.group_reply_mode == "auto":
+            await self._auto_reply_gate(payload)
         if (
             self._config.monitor_enabled
             and message_type == "group"
@@ -2252,6 +2973,56 @@ class OneBot11Channel(BaseChannel):
         if self._self_id:
             self._login_confirmed = True
         self.enqueue(payload)
+
+    async def _auto_reply_gate(self, payload: dict[str, Any]) -> None:
+        """Autonomous participation: decide whether an unaddressed message goes to the agent.
+
+        Approved messages are marked ``_octop_auto`` and then travel the normal
+        path as if the bot had been addressed; everything else stays passive
+        context, exactly as in ``mention`` mode.
+        """
+        group_id = str(payload.get("group_id") or "")
+        gate = self._auto_gate
+        if not group_id:
+            return
+        if self._event_triggers(payload):
+            gate.arrive(group_id)  # addressed messages still make the chat "busy"
+            return
+        reply_to = ""
+        message = payload.get("message")
+        segments = self._parse_cq_string(message) if isinstance(message, str) else message
+        for seg in segments if isinstance(segments, list) else []:
+            if isinstance(seg, dict) and seg.get("type") == "reply":
+                data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                reply_to = str(data.get("id") or "")
+                break
+        reply_to_bot = False
+        if reply_to:
+            store = self.history_store()
+            if store is not None:
+                direction = await asyncio.to_thread(
+                    store.message_direction,
+                    channel_id=self.channel_id,
+                    chat_type="group",
+                    chat_id=group_id,
+                    message_id=reply_to,
+                )
+                reply_to_bot = direction == "out"
+        decision = gate.evaluate(group_id, self._raw_text(payload), reply_to_bot=reply_to_bot)
+        if decision.engage:
+            payload["_octop_auto"] = decision.reason
+            self._auto_engaged_at[group_id] = time.monotonic()
+            self._auto_engaged_at.move_to_end(group_id)
+            while len(self._auto_engaged_at) > _AUTO_TRACK_CAP:
+                self._auto_engaged_at.popitem(last=False)
+            self._stats.auto_engaged += 1
+            logger.info(
+                "OneBot11 auto-engaged in group %s (score=%.2f, %s)", group_id, decision.score, decision.reason
+            )
+        else:
+            logger.debug(
+                "OneBot11 auto gate held back group %s (score=%.2f, %s)", group_id, decision.score, decision.blocked
+            )
 
     def _has_forward_segment(self, payload: dict[str, Any]) -> bool:
         message = payload.get("message")
@@ -2296,16 +3067,22 @@ class OneBot11Channel(BaseChannel):
         """Flatten the shapes ``get_forward_msg`` is known to return.
 
         * a bare list of messages;
-        * ``{"messages": [...]}`` (go-cqhttp / NapCat);
+        * ``{"messages": [...]}`` (go-cqhttp / NapCat), optionally wrapped once
+          more in ``{"data": ...}`` by HTTP-style clients;
         * ``{"message": [node, ...]}`` with OneBot 11 ``node`` segments.
 
         Each entry becomes ``{"sender": {"nickname": ...}, "message": <segments|CQ string|None>}``.
+        An entry that only carries ``raw_message`` still keeps its text.
         """
         items: Any = resolved
-        if isinstance(resolved, dict):
-            items = resolved.get("messages")
-            if items is None:
-                items = resolved.get("message")
+        for _ in range(2):  # tolerate one extra {"data": ...} envelope
+            if isinstance(items, dict) and isinstance(items.get("data"), (dict, list)) and not (
+                "messages" in items or "message" in items
+            ):
+                items = items["data"]
+        if isinstance(items, dict):
+            inner = items.get("messages")
+            items = inner if inner is not None else items.get("message")
         if not isinstance(items, list):
             return []
         out: list[dict[str, Any]] = []
@@ -2326,6 +3103,8 @@ class OneBot11Channel(BaseChannel):
             content = data.get("message")
             if content is None:
                 content = data.get("content")
+            if content is None and data.get("raw_message"):
+                content = str(data.get("raw_message"))
             out.append({"sender": {"nickname": str(name)}, "message": content})
         return out
 
@@ -2396,6 +3175,15 @@ class OneBot11Channel(BaseChannel):
                     notice_type,
                     payload.get("message_id"),
                 )
+            elif notice_type == "bot_offline":
+                # NapCat's own notice: the QQ account was kicked offline (login elsewhere, risk control ...).
+                reason = " ".join(str(payload.get("message") or payload.get("tag") or "").split())[:120]
+                self._runtime_error = f"QQ 账号被踢下线{('：' + reason) if reason else ''}，需要在 NapCat 重新登录"
+                owner_session = owner
+                if owner_session is not None:
+                    owner_session.login_confirmed = False
+                    self._refresh_state()
+                logger.warning("OneBot11 bot went offline: %s", reason or "unknown reason")
             elif notice_type == "group_increase" and str(payload.get("user_id") or "") == self._self_id:
                 logger.info("OneBot11 bot joined group %s", payload.get("group_id"))
             else:
@@ -2528,9 +3316,20 @@ class OneBot11Channel(BaseChannel):
             return
         if not text.strip():
             return
-        if (subject.metadata or {}).get("monitor") and text.strip() in _MONITOR_SKIP_TEXTS:
-            logger.info("OneBot11 monitor skip reply dropped")
-            return
+        meta = subject.metadata or {}
+        if self._is_skip_reply(text):
+            group_id = str(meta.get("group_id") or "")
+            engaged_at = self._auto_engaged_at.get(group_id) if group_id else None
+            auto = bool(meta.get("auto_engaged")) or (
+                engaged_at is not None and time.monotonic() - engaged_at < _AUTO_SKIP_WINDOW
+            )
+            if auto:
+                self._stats.auto_declined += 1
+                logger.info("OneBot11 auto-participation declined by the agent")
+                return
+            if meta.get("monitor"):
+                logger.info("OneBot11 monitor skip reply dropped")
+                return
         chunks = self._split_text(text)
         for index, chunk in enumerate(chunks):
             # One OneBot message per chunk (QQ caps a single message's length);
@@ -2543,6 +3342,11 @@ class OneBot11Channel(BaseChannel):
             )
             if not delivered:
                 break
+
+    @staticmethod
+    def _is_skip_reply(text: str) -> bool:
+        """True when the agent answered with the "nothing to add" sentinel (tolerating stray punctuation)."""
+        return text.strip().strip("。.!！ \t\r\n") in _SKIP_REPLY_TEXTS
 
     async def _send_content(self, subject: ChannelSubject, parts: list[ContentPart]) -> None:
         for part in parts:
@@ -2605,6 +3409,8 @@ class OneBot11Channel(BaseChannel):
             logger.warning("OneBot11 passive send blocked by policy: %s", denial)
             return False
         action, params = self._build_send_action(subject, segments)
+        if not await self._wait_for_chat_slot(self._chat_key(action, params)):
+            return False
         account = str((subject.metadata or {}).get("self_id") or "").strip()
         if account and self._select_session(account) is None:
             # The inbound account's session is gone; fall back to the primary
@@ -2614,7 +3420,8 @@ class OneBot11Channel(BaseChannel):
         if self._config.reply_with_quote and quote_id:
             quoted = [{"type": "reply", "data": {"id": quote_id}}, *segments]
             try:
-                await self._call_api(action, {**params, "message": quoted}, account=account)
+                result = await self._call_api(action, {**params, "message": quoted}, account=account)
+                await self._history_record_outbound(action, params, quoted, result, account)
                 return True
             except OneBotAPIError as exc:
                 logger.info("OneBot11 quote reply failed, retrying without quote: %s", exc)
@@ -2624,14 +3431,96 @@ class OneBot11Channel(BaseChannel):
                 logger.warning("OneBot11 send skipped, socket unavailable: %s", exc)
                 return False
         try:
-            await self._call_api(action, {**params, "message": segments}, account=account)
+            result = await self._call_api(action, {**params, "message": segments}, account=account)
         except OneBotAPIError as exc:
             logger.warning("OneBot11 send failed: %s", exc)
             return False
         except _TRANSPORT_ERRORS as exc:
             logger.warning("OneBot11 send skipped, socket unavailable: %s", exc)
             return False
+        await self._history_record_outbound(action, params, segments, result, account)
         return True
+
+    async def _wait_for_chat_slot(self, key: str) -> bool:
+        """Passive replies: sleep until the chat's quota has room, but never forever.
+
+        The reply already exists, so waiting is better than dropping it; the
+        wait is bounded (a few quota windows) so one hot group cannot pin a
+        worker.  False means the reply was given up on.
+        """
+        for attempt in range(3):
+            wait = self._chat_quota_take(key)
+            if wait <= 0:
+                return True
+            self._stats.throttled_sends += 1
+            logger.info(
+                "OneBot11 per-chat quota reached for %s; delaying the reply %.1fs", key, wait
+            )
+            await asyncio.sleep(min(wait, float(self._config.send_rate_limit_window)) + 0.05)
+        logger.warning("OneBot11 per-chat quota still exhausted for %s; reply dropped", key)
+        return False
+
+    @staticmethod
+    def _delivered_message_id(result: Any) -> str:
+        """``message_id`` NapCat returned for a send action ('' when it gave none)."""
+        if isinstance(result, dict):
+            value = result.get("message_id")
+            if value not in (None, "", 0, "0"):
+                return str(value)
+        return ""
+
+    async def _history_record_outbound(
+        self,
+        action: str,
+        params: dict[str, Any],
+        segments: list[dict[str, Any]],
+        result: Any,
+        account: str = "",
+    ) -> None:
+        """Remember what the bot itself said, so a history lookup shows both sides."""
+        if not self._config.history_enabled or action not in ("send_group_msg", "send_private_msg"):
+            return
+        try:
+            is_group = action == "send_group_msg"
+            chat_id = str((params.get("group_id") if is_group else params.get("user_id")) or "")
+            text_parts: list[str] = []
+            media: list[dict[str, Any]] = []
+            reply_to = ""
+            for seg in segments:
+                seg_type = str(seg.get("type") or "")
+                data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                if seg_type == "text":
+                    text_parts.append(str(data.get("text") or ""))
+                elif seg_type == "at":
+                    text_parts.append(f"@{data.get('qq') or ''} ")
+                elif seg_type == "reply":
+                    reply_to = str(data.get("id") or "")
+                elif seg_type in ("image", "record", "video", "file"):
+                    media.append(self._history_media_item(seg_type, data))
+            store = self.history_store()
+            if store is None or not chat_id:
+                return
+            self_id = account or self._self_id
+            await asyncio.to_thread(
+                store.record,
+                channel_id=self.channel_id,
+                self_id=str(self_id or ""),
+                chat_type="group" if is_group else "private",
+                chat_id=chat_id,
+                message_id=self._delivered_message_id(result),
+                sender_id=str(self_id or ""),
+                sender_name="",
+                ts=time.time(),
+                text="".join(text_parts).strip(),
+                media=media,
+                mentioned=False,
+                reply_to=reply_to,
+                direction="out",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - history must never break sending
+            logger.warning("OneBot11 history record (outbound) failed: %s", exc)
 
     def _build_send_action(
         self,
@@ -2675,12 +3564,48 @@ class OneBot11Channel(BaseChannel):
         account = str(account or "").strip()
         session = self._select_session(account)
         if account and session is None:
+            self._note_send_outcome(action, ConnectionError("account not connected"))
             raise ConnectionError(f"OneBot 11 账号 {account} 未连接")
-        if session is None:
-            if self._http_available():
-                return await self._call_api_http(action, params, timeout)
-            raise ConnectionError("OneBot 11 WebSocket is not connected")
-        return await self._api_via_session(session, action, params, timeout)
+        try:
+            if session is None:
+                if self._http_available():
+                    result = await self._call_api_http(action, params, timeout)
+                else:
+                    raise ConnectionError("OneBot 11 WebSocket is not connected")
+            else:
+                result = await self._api_via_session(session, action, params, timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify, then let the caller decide
+            self._note_send_outcome(action, exc)
+            raise
+        self._note_send_outcome(action, None)
+        if action == "send_group_msg" and self._config.group_reply_mode == "auto":
+            self._auto_gate.note_bot_spoke(str(params.get("group_id") or ""))
+        return result
+
+    def _note_connected(self) -> None:
+        # A reconnect may land on a newer NapCat: ask about voice transcription again.
+        self._ptt_text_unsupported = False
+        self._stats.connections += 1
+        self._stats.last_connect_at = time.time()
+
+    def _note_send_outcome(self, action: str, error: BaseException | None) -> None:
+        """Count one send attempt (only message-sending actions are tallied)."""
+        if not action.startswith("send_"):
+            return
+        stats = self._stats
+        if error is None:
+            stats.send_ok += 1
+            return
+        if isinstance(error, OneBotAPIError):
+            stats.send_rejected += 1
+        elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            stats.send_unconfirmed += 1
+        else:
+            stats.send_transport_errors += 1
+        stats.last_send_error = f"{action}: {error.__class__.__name__}: {error}"[:300]
+        stats.last_send_error_at = time.time()
 
     async def _api_via_session(
         self,
@@ -2703,11 +3628,11 @@ class OneBot11Channel(BaseChannel):
                 timeout=float(timeout or self._config.request_timeout_seconds),
             )
         except (TimeoutError, asyncio.TimeoutError):
-            session.pending.pop(echo, None)
             raise TimeoutError(f"OneBot action timed out: {action}") from None
-        except Exception:
+        finally:
+            # Also covers cancellation (a caller giving up on its own deadline):
+            # the slot must not wait for an answer nobody will read.
             session.pending.pop(echo, None)
-            raise
 
         status = str(response.get("status") or "")
         retcode = response.get("retcode", 0)
@@ -2790,14 +3715,33 @@ class OneBot11Channel(BaseChannel):
         group_id = str(event.get("group_id") or "")
         self_id = str(event.get("self_id") or self._self_id or self._config.self_id or "")
         sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
-        sender_name = str(sender.get("card") or sender.get("nickname") or user_id)
+        display_name = str(sender.get("card") or sender.get("nickname") or user_id)
+        # The core renders group context lines with ``metadata["sender_name"]``
+        # alone, so a rename would make the same person look like a stranger.
+        # Appending the QQ number keeps one stable identity per person; the bare
+        # nickname stays available as ``sender_nickname``.
+        if self._config.sender_label_with_id and not (
+            event.get("_octop_monitor") or event.get("_octop_poke")
+        ):
+            sender_name = history_mod.format_display_name(display_name, user_id)
+        else:
+            sender_name = display_name
 
-        content, bot_mentioned, reply_to, mentions = self._parse_message_content(event.get("message"), self_id)
+        media_refs: list[_MediaRef] = []
+        content, bot_mentioned, reply_to, mentions = self._parse_message_content(
+            event.get("message"), self_id, media_refs
+        )
+        bot_mentioned_by_user = bot_mentioned
         keyword_triggered = False
         trigger_reason = "at" if bot_mentioned else ""
+        auto_decision = event.get("_octop_auto")
         if event.get("_octop_monitor") or event.get("_octop_poke"):
             bot_mentioned = True
             trigger_reason = "monitor" if event.get("_octop_monitor") else "poke"
+        elif auto_decision and not bot_mentioned:
+            # The autonomous-participation gate approved this unaddressed message.
+            bot_mentioned = True
+            trigger_reason = str(auto_decision)
         elif not bot_mentioned and self._keywords:
             plain = "\n".join(part.text for part in content if isinstance(part, TextContent) and part.text)
             hit = self._keyword_hit(plain)
@@ -2813,24 +3757,42 @@ class OneBot11Channel(BaseChannel):
                     continue
                 fwd_sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
                 name = str(fwd_sender.get("card") or fwd_sender.get("nickname") or fwd_sender.get("user_id") or "?")
-                raw_segs = item.get("message")
-                if isinstance(raw_segs, str):
-                    segs = self._parse_cq_string(raw_segs)
-                elif isinstance(raw_segs, list):
-                    segs = raw_segs
-                else:
-                    segs = []
-                fwd_text = "".join(
-                    str((seg.get("data") or {}).get("text") or "")
-                    for seg in segs
-                    if isinstance(seg, dict) and seg.get("type") == "text"
-                )
+                fwd_text = self._forward_entry_text(item.get("message"))
                 if fwd_text:
                     lines.append(f"{name}: {fwd_text[:120]}")
             if lines:
                 content.append(TextContent(text="[合并转发]\n" + "\n".join(lines[:20])))
         if not content:
             content = [TextContent(text="")]
+
+        timestamp = event.get("time")
+        try:
+            ts = float(timestamp) if timestamp is not None else time.time()
+        except (TypeError, ValueError):
+            ts = time.time()
+
+        if self._config.message_time_prefix and not (
+            event.get("_octop_monitor") or event.get("_octop_poke")
+        ):
+            # Only the text handed to the model carries the clock time; history
+            # storage and keyword matching use the untouched event.
+            stamp = history_mod.format_clock(ts, tz=self.display_tz(), with_date=True)
+            first = next((i for i, part in enumerate(content) if isinstance(part, TextContent)), None)
+            if first is None:
+                content.insert(0, TextContent(text=f"[{stamp}]"))
+            else:
+                # In place: a media placeholder ("[语音]") may be this very part.
+                head = content[first]
+                head.text = f"[{stamp}] {head.text}".rstrip()
+
+        auto_engaged = bool(auto_decision) and not bot_mentioned_by_user
+        if auto_engaged:
+            first = next((i for i, part in enumerate(content) if isinstance(part, TextContent)), None)
+            if first is None:
+                content.insert(0, TextContent(text=_AUTO_REPLY_HINT))
+            else:
+                head = content[first]
+                head.text = f"{_AUTO_REPLY_HINT}\n{head.text}"
 
         subject_id = f"group:{group_id}" if is_group else f"user:{user_id}"
         metadata = {
@@ -2846,22 +3808,19 @@ class OneBot11Channel(BaseChannel):
             "group_id": group_id,
             "self_id": self_id,
             "sender_name": sender_name,
+            "sender_nickname": display_name,
             "bot_mentioned": bot_mentioned,
             "keyword_triggered": keyword_triggered,
             "trigger_reason": trigger_reason,
+            "auto_engaged": auto_engaged,
             "reply_to": reply_to,
             "mentions": mentions,
             "monitor": bool(event.get("_octop_monitor")),
             "poke": bool(event.get("_octop_poke")),
             "raw_message": str(event.get("raw_message") or ""),
         }
-        timestamp = event.get("time")
-        try:
-            ts = float(timestamp) if timestamp is not None else time.time()
-        except (TypeError, ValueError):
-            ts = time.time()
 
-        return InboundMessage(
+        inbound = InboundMessage(
             channel_id=self.channel_id,
             channel_type=self.channel_type,
             tenant_id=self.tenant_id,
@@ -2878,11 +3837,407 @@ class OneBot11Channel(BaseChannel):
             metadata=metadata,
             timestamp=ts,
         )
+        if media_refs and message_id and not (event.get("_octop_monitor") or event.get("_octop_poke")):
+            self._remember_media_refs(metadata, media_refs)
+        return inbound
+
+    # ------------------------------------------------------------------
+    # Inbound media (R11): fetch images, transcribe voice notes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _media_key(metadata: dict[str, Any]) -> str:
+        return "|".join(
+            str(metadata.get(name) or "") for name in ("self_id", "message_type", "group_id", "user_id", "message_id")
+        )
+
+    def _remember_media_refs(self, metadata: dict[str, Any], refs: list[_MediaRef]) -> None:
+        key = self._media_key(metadata)
+        self._media_refs[key] = refs
+        self._media_refs.move_to_end(key)
+        while len(self._media_refs) > _MEDIA_REF_CAP:
+            self._media_refs.popitem(last=False)
+
+    def _asr_config(self) -> Any | None:
+        """Speech-to-text endpoint, or ``None`` when voice transcription is not configured."""
+        cfg = self._config
+        if not cfg.asr_base_url:
+            return None
+        return media_mod.AsrConfig(
+            base_url=cfg.asr_base_url,
+            api_key=cfg.asr_api_key,
+            model=cfg.asr_model,
+            language=cfg.asr_language,
+            timeout=min(90.0, cfg.media_timeout_seconds * 2),
+        )
+
+    def _media_limit(self) -> int:
+        return int(self._config.media_max_mb * 1024 * 1024)
+
+    def _trusted_media_hosts(self) -> tuple[str, ...]:
+        """Extra hosts media may be fetched from: the operator's list plus NapCat's own host."""
+        cfg = self._config
+        hosts = list(media_mod.parse_host_list(cfg.media_allowed_hosts))
+        for raw in (cfg.ws_url, cfg.http_api_url):
+            host = media_mod.host_of(str(raw or ""))
+            if host:
+                hosts.append(host)
+        return tuple(dict.fromkeys(hosts))
+
+    def _media_allowed(self, url: str) -> bool:
+        return media_mod.host_allowed(url, self._trusted_media_hosts())
+
+    async def fetch_remote_media(self, url: str) -> tuple[bytes, str]:
+        """Core hook: trusted QQ hosts are fetched with a browser-like UA, anything else as before."""
+        if self._media_allowed(url):
+            http = await self._ensure_http()
+            return await media_mod.download(
+                http,
+                url,
+                max_bytes=self._media_limit(),
+                timeout=self._config.media_timeout_seconds,
+                allowed=self._media_allowed,
+            )
+        return await super().fetch_remote_media(url)
+
+    def _media_wanted(self, message: InboundMessage, kind: str) -> bool:
+        """Whether this message's media is worth resolving.
+
+        Voice costs money (speech-to-text), so only messages that will reach the
+        agent are transcribed.  Images follow the core's own rule, which also
+        covers passive group messages kept as recent context.
+        """
+        meta = message.metadata or {}
+        reaches_agent = (
+            meta.get("chat_type") == "dm"
+            or bool(meta.get("bot_mentioned"))
+            or self._config.group_reply_mode == "always"
+        )
+        if kind == "record" or reaches_agent:
+            return reaches_agent
+        keeper = getattr(self, "_group_context", None)
+        if keeper is None:
+            return False
+        try:
+            return bool(keeper.should_persist_media(message))
+        except Exception:  # noqa: BLE001 - policy lookup must not break message handling
+            return False
+
+    async def _preprocess_inbound(self, message: InboundMessage) -> None:
+        """Core hook (runs before the group policy): resolve images / voice notes.
+
+        Best effort by design: whatever goes wrong here leaves the message as
+        :meth:`parse_inbound` built it, so a flaky CDN never costs a reply.
+        """
+        meta = message.metadata or {}
+        _REQUESTER.set(
+            Requester(
+                channel_id=self.channel_id,
+                chat_type="group" if meta.get("is_group") else "private",
+                chat_id=str(meta.get("group_id") or "") if meta.get("is_group") else str(meta.get("user_id") or ""),
+                sender_id=str(meta.get("sender_id") or meta.get("user_id") or ""),
+                message_id=str(meta.get("message_id") or ""),
+                self_id=str(meta.get("self_id") or ""),
+            )
+        )
+        refs = self._media_refs.pop(self._media_key(meta), None)
+        if not refs:
+            return
+        asr = self._asr_config()
+        voice_wanted = asr is not None or bool(self._config.asr_napcat_fallback)
+        wanted = [
+            ref
+            for ref in refs
+            if (ref.kind == "image" and self._config.media_fetch_enabled)
+            or (ref.kind == "record" and voice_wanted)
+        ]
+        wanted = [ref for ref in wanted if self._media_wanted(message, ref.kind)]
+        if not wanted:
+            return
+        images = [ref for ref in wanted if ref.kind == "image"][:_MEDIA_MAX_IMAGES]
+        voices = [ref for ref in wanted if ref.kind == "record"][:_MEDIA_MAX_VOICES]
+        account = str(meta.get("self_id") or "") if len(self._sessions) > 1 else ""
+        budget = self._config.media_timeout_seconds * 2 + 10
+        if voices and self._config.asr_napcat_fallback:
+            budget += _PTT_TEXT_TIMEOUT
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *[self._resolve_image(message, ref, account) for ref in images],
+                    *[self._resolve_voice(message, ref, account, asr) for ref in voices],
+                    return_exceptions=True,
+                ),
+                timeout=budget,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("OneBot11 media for message %s not ready within %.0fs", meta.get("message_id"), budget)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OneBot11 media resolution failed: %s", exc)
+
+    @staticmethod
+    def _part_index(message: InboundMessage, part: Any) -> int:
+        for index, item in enumerate(message.content):
+            if item is part:
+                return index
+        return -1
+
+    async def _download_media(self, url: str) -> bytes:
+        http = await self._ensure_http()
+        async with self._media_sem:
+            data, _ = await media_mod.download(
+                http,
+                url,
+                max_bytes=self._media_limit(),
+                timeout=self._config.media_timeout_seconds,
+                allowed=self._media_allowed,
+            )
+        return data
+
+    async def _media_via_napcat(self, kind: str, data: dict[str, Any], account: str, out_format: str = "") -> bytes:
+        """Ask NapCat for the media behind a segment (``get_image`` / ``get_record``).
+
+        Returns the bytes when the reply carries them (base64, or a URL on a
+        trusted host); an empty result means NapCat only named a file on its
+        own disk, which this process cannot read.
+        """
+        file_ref = str(data.get("file") or "").strip()
+        file_id = str(data.get("file_id") or "").strip()
+        ref = file_ref or file_id
+        if not ref or ref.lower().startswith(("http://", "https://", "base64://")):
+            return b""
+        params: dict[str, Any] = {"file": ref}
+        if file_id:
+            params["file_id"] = file_id
+        if kind == "record" and out_format:
+            params["out_format"] = out_format
+        action = "get_image" if kind == "image" else "get_record"
+        timeout = min(30.0, self._config.media_timeout_seconds)
+        result = await self._call_api(action, params, timeout=timeout, account=account)
+        info = media_mod.parse_media_info(result)
+        if info.base64:
+            return media_mod.decode_base64_capped(info.base64, self._media_limit())
+        if info.url and self._media_allowed(info.url):
+            return await self._download_media(info.url)
+        if info.file:
+            logger.debug("OneBot11 %s answered with a path on the NapCat host only (%s)", action, info.file[:80])
+        return b""
+
+    async def _store_media(self, part: Any, raw: bytes, mime: str) -> None:
+        """Hand bytes to the part: a media-backend key when there is a backend, else inline base64."""
+        backend = getattr(self, "_media_backend", None)
+        if backend is not None:
+            try:
+                digest = hashlib.sha1(raw).hexdigest()[:10]
+                key = (
+                    f"{self.channel_type}/{self.channel_id}/"
+                    f"{int(time.time())}_{digest}{media_mod.extension_for(mime)}"
+                )
+                await backend.save(raw, key)
+                part.local_path = key
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back to inline bytes
+                logger.debug("OneBot11 media backend save failed (%s); inlining", exc)
+        part.data = base64.b64encode(raw).decode("ascii")
+
+    async def _resolve_image(self, message: InboundMessage, ref: _MediaRef, account: str) -> None:
+        part = ref.part
+        url = part.url if isinstance(part, ImageContent) else ""
+        raw = b""
+        errors: list[str] = []
+        if url:
+            try:
+                raw = await self._download_media(url)
+            except Exception as exc:  # noqa: BLE001 - try NapCat next
+                errors.append(f"{type(exc).__name__}: {exc}")
+        if not raw:
+            try:
+                raw = await self._media_via_napcat("image", ref.data, account)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"get_image {type(exc).__name__}: {exc}")
+        mime = media_mod.sniff_image_mime(raw) if raw else ""
+        index = self._part_index(message, part)
+        if not mime or index < 0:
+            if index >= 0:
+                self._stats.media_images_failed += 1
+                logger.warning(
+                    "OneBot11 image of message %s not fetched: %s",
+                    (message.metadata or {}).get("message_id"),
+                    "; ".join(errors) or "no usable image data",
+                )
+            return
+        image = ImageContent(
+            url=url,
+            alt_text=str(ref.data.get("summary") or ""),
+            mime_type=mime,
+            size=len(raw),
+        )
+        await self._store_media(image, raw, mime)
+        if isinstance(part, TextContent):
+            # The placeholder may share its text part with the clock prefix: keep that.
+            remainder = part.text.replace("[图片]", "", 1).strip()
+            if remainder:
+                part.text = remainder
+                message.content.insert(index + 1, image)
+            else:
+                message.content[index] = image
+        else:
+            message.content[index] = image
+        self._stats.media_images_fetched += 1
+
+    async def _transcribe_external(
+        self, ref: _MediaRef, account: str, asr: Any, errors: list[str]
+    ) -> str:
+        """Fetch the audio (converted by NapCat when possible) and send it to the ASR service."""
+        part = ref.part
+        url = part.url if isinstance(part, AudioContent) else ""
+        raw = b""
+        for out_format in ("mp3", "wav", ""):
+            try:
+                raw = await self._media_via_napcat("record", ref.data, account, out_format)
+            except Exception as exc:  # noqa: BLE001 - next format / the plain URL
+                errors.append(f"get_record({out_format or 'raw'}) {type(exc).__name__}: {exc}")
+                continue
+            if raw:
+                break
+        if not raw and url:
+            try:
+                raw = await self._download_media(url)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+        if not raw:
+            return ""
+        mime = media_mod.sniff_audio_mime(raw) or "audio/mpeg"
+        try:
+            http = await self._ensure_http()
+            return await media_mod.transcribe(
+                http,
+                asr,
+                raw,
+                filename="voice" + media_mod.extension_for(mime, ".mp3"),
+                mime=mime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"asr {type(exc).__name__}: {exc}")
+            return ""
+
+    async def _transcribe_via_napcat(self, meta: dict[str, Any], account: str, errors: list[str]) -> str:
+        """QQ's own speech-to-text through NapCat (``fetch_ptt_text``): free, no third party, no audio download."""
+        message_id = str(meta.get("message_id") or "").strip()
+        if not message_id or self._ptt_text_unsupported:
+            return ""
+        try:
+            result = await self._call_api(
+                "fetch_ptt_text",
+                {"message_id": self._normalize_id(message_id)},
+                timeout=_PTT_TEXT_TIMEOUT,
+                account=account,
+            )
+        except Exception as exc:  # noqa: BLE001 - expired message, no text, old NapCat: keep the placeholder
+            if isinstance(exc, OneBotAPIError) and (
+                str(exc.retcode) == "1404" or re.search(r"不支持的\s*api", exc.message, re.IGNORECASE)
+            ):
+                # An older NapCat without the action: do not warn about every voice note.
+                self._ptt_text_unsupported = True
+                logger.info("OneBot11 NapCat has no fetch_ptt_text; voice notes stay untranscribed until it reconnects")
+                return ""
+            errors.append(f"fetch_ptt_text {type(exc).__name__}: {exc}")
+            return ""
+        text = str(result.get("text") or "") if isinstance(result, dict) else ""
+        text = " ".join(text.split())[:_PTT_TEXT_MAX_CHARS]
+        if not text:
+            errors.append("fetch_ptt_text returned no text")
+        return text
+
+    async def _resolve_voice(self, message: InboundMessage, ref: _MediaRef, account: str, asr: Any) -> None:
+        part = ref.part
+        meta = message.metadata or {}
+        errors: list[str] = []
+        text = ""
+        via_napcat = False
+        if asr is not None:
+            text = await self._transcribe_external(ref, account, asr, errors)
+        if not text and self._config.asr_napcat_fallback:
+            text = await self._transcribe_via_napcat(meta, account, errors)
+            via_napcat = bool(text)
+        index = self._part_index(message, part)
+        if not text or index < 0:
+            if index >= 0:
+                self._stats.voice_failed += 1
+                logger.warning(
+                    "OneBot11 voice of message %s not transcribed: %s",
+                    meta.get("message_id"),
+                    "; ".join(errors) or "no audio data",
+                )
+            return
+        transcript = f"{_VOICE_TRANSCRIPT_PREFIX}{text}"
+        if isinstance(part, TextContent):
+            part.text = part.text.replace("[语音]", transcript, 1) if "[语音]" in part.text else transcript
+        else:
+            message.content[index] = TextContent(text=transcript)
+        self._stats.voice_transcribed += 1
+        if via_napcat:
+            self._stats.voice_transcribed_napcat += 1
+        await self._history_annotate(meta, f"[语音转文字：{text}]")
+
+    async def _history_annotate(self, meta: dict[str, Any], text: str) -> None:
+        """Append late-arriving text (a voice transcript) to the stored copy of the message."""
+        if not self._config.history_enabled:
+            return
+        store = self.history_store()
+        message_id = str(meta.get("message_id") or "")
+        if store is None or not message_id:
+            return
+        is_group = bool(meta.get("is_group"))
+        try:
+            await asyncio.to_thread(
+                store.append_text,
+                channel_id=self.channel_id,
+                self_id=str(meta.get("self_id") or self._self_id or ""),
+                chat_type="group" if is_group else "private",
+                chat_id=str(meta.get("group_id") or "") if is_group else str(meta.get("user_id") or ""),
+                message_id=message_id,
+                text=text,
+            )
+        except Exception as exc:  # noqa: BLE001 - history is an add-on
+            logger.warning("OneBot11 history annotate failed: %s", exc)
+
+    def _forward_entry_text(self, raw: Any) -> str:
+        """Readable text of one forwarded message (text kept, media shown as markers)."""
+        if isinstance(raw, str):
+            segments = self._parse_cq_string(raw)
+        elif isinstance(raw, list):
+            segments = [seg for seg in raw if isinstance(seg, dict)]
+        else:
+            return ""
+        markers = {
+            "image": "[图片]",
+            "record": "[语音]",
+            "video": "[视频]",
+            "file": "[文件]",
+            "forward": "[嵌套合并转发]",
+            "face": "[表情]",
+            "json": "[卡片消息]",
+            "xml": "[XML 消息]",
+        }
+        pieces: list[str] = []
+        for seg in segments:
+            seg_type = str(seg.get("type") or "")
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            if seg_type == "text":
+                pieces.append(str(data.get("text") or ""))
+            elif seg_type == "at":
+                pieces.append(f"@{data.get('name') or data.get('qq') or ''} ")
+            elif seg_type in markers:
+                pieces.append(markers[seg_type])
+        return "".join(pieces).strip()
 
     def _parse_message_content(
         self,
         message: Any,
         self_id: str,
+        media_refs: list[_MediaRef] | None = None,
     ) -> tuple[list[ContentPart], bool, str, list[dict[str, str]]]:
         parts: list[ContentPart] = []
         bot_mentioned = False
@@ -2915,13 +4270,16 @@ class OneBot11Channel(BaseChannel):
             elif seg_type == "reply":
                 reply_to = str(data.get("id") or "")
             elif seg_type == "image":
-                parts.append(self._image_part(data))
+                part = self._image_part(data)
+                parts.append(part)
+                if media_refs is not None:
+                    media_refs.append(_MediaRef("image", part, data))
             elif seg_type == "record":
                 url = self._http_url(data)
-                if url:
-                    parts.append(AudioContent(url=url))
-                else:
-                    parts.append(TextContent(text="[语音]"))
+                part = AudioContent(url=url) if url else TextContent(text="[语音]")
+                parts.append(part)
+                if media_refs is not None:
+                    media_refs.append(_MediaRef("record", part, data))
             elif seg_type == "video":
                 url = self._http_url(data)
                 if url:
@@ -3032,6 +4390,7 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "ws_url",
+        "showWhen": {"field": "connection_mode", "notEquals": "reverse"},
         "label": "NapCat WebSocket 地址",
         "type": "text",
         "placeholder": "ws://127.0.0.1:3001",
@@ -3048,6 +4407,7 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "listen_host",
+        "showWhen": {"field": "connection_mode", "equals": "reverse"},
         "label": "反向监听地址",
         "type": "text",
         "placeholder": "0.0.0.0",
@@ -3056,6 +4416,7 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "listen_port",
+        "showWhen": {"field": "connection_mode", "equals": "reverse"},
         "label": "反向监听端口",
         "type": "number",
         "placeholder": "3002",
@@ -3064,6 +4425,7 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "listen_path",
+        "showWhen": {"field": "connection_mode", "equals": "reverse"},
         "label": "反向监听路径",
         "type": "text",
         "placeholder": "/onebot/v11/ws",
@@ -3072,6 +4434,7 @@ _FIELDS: list[dict[str, Any]] = [
     },
     {
         "name": "reverse_allow_no_token",
+        "showWhen": {"field": "connection_mode", "equals": "reverse"},
         "label": "允许无令牌的反向监听（不安全）",
         "type": "switch",
         "required": False,
@@ -3092,12 +4455,41 @@ _FIELDS: list[dict[str, Any]] = [
         "type": "select",
         "placeholder": "默认：仅被 @ 或关键词时回复",
         "required": False,
-        "help": "控制机器人在群里什么时候应答。“全部回复”会对群内每条消息调用模型，可能产生较多消息和调用费用。",
+        "help": (
+            "控制机器人在群里什么时候应答。“自主参与”在被 @ 之外，还会对看起来在提问/求助的消息调用一次模型，"
+            "由 AI 判断是否插话，调用次数受下方的冷却时间和每小时上限约束；“全部回复”会对群内每条消息调用模型，"
+            "可能产生较多消息和调用费用。"
+        ),
         "options": [
             {"label": "仅被 @ 或关键词时回复（推荐）", "value": "mention"},
+            {"label": "自主参与（被 @ 外，遇到提问/求助时也会插话）", "value": "auto"},
             {"label": "全部回复（每条群消息都应答）", "value": "always"},
             {"label": "不回复（只接收不应答）", "value": "off"},
         ],
+    },
+    {
+        "name": "auto_reply_threshold",
+        "label": "自主参与的积极程度（阈值）",
+        "type": "number",
+        "placeholder": "0.6",
+        "required": False,
+        "help": "仅“自主参与”策略生效。数值越小越爱插话（0.3 很积极），越大越克制（1.0 基本只在明确求助时出声）。默认 0.6：问句或求助类消息会触发，闲聊和短回复不会。",
+    },
+    {
+        "name": "auto_reply_cooldown_seconds",
+        "label": "自主参与冷却时间（秒）",
+        "type": "number",
+        "placeholder": "120",
+        "required": False,
+        "help": "仅“自主参与”策略生效。同一个群两次主动插话之间至少间隔这么久（默认 120 秒），避免刷屏。被引用回复的消息不受此限制。",
+    },
+    {
+        "name": "auto_reply_max_per_hour",
+        "label": "自主参与每小时上限（次）",
+        "type": "number",
+        "placeholder": "6",
+        "required": False,
+        "help": "仅“自主参与”策略生效。每个群每小时最多主动让 AI 判断几次（默认 6）。这是 Token 成本的硬上限：即使 AI 最终选择不回复，也算一次。",
     },
     {
         "name": "trigger_keywords",
@@ -3126,7 +4518,128 @@ _FIELDS: list[dict[str, Any]] = [
         "type": "number",
         "placeholder": "10",
         "required": False,
-        "help": "回复时携带的最近群消息条数（默认 10），0 表示不携带历史。",
+        "help": (
+            "每次回复时随提示词携带的最近群消息条数（默认 10），0 表示不携带。"
+            "开启下方“保存聊天记录”后可以放心调小甚至设为 0：Agent 需要背景时会用查询工具按需检索，"
+            "不必每次都把固定条数塞进提示词，可明显节省 Token。"
+        ),
+    },
+    {
+        "name": "sender_label_with_id",
+        "label": "发言人标注 QQ 号",
+        "type": "switch",
+        "required": False,
+        "help": "默认开启：群消息中的发言人显示为“昵称(QQ号)”。群昵称可以重复或随时改名，QQ 号才是唯一标识，Agent 靠它区分不同的人。",
+    },
+    {
+        "name": "message_time_prefix",
+        "label": "消息带时间戳",
+        "type": "switch",
+        "required": False,
+        "help": "默认开启：每条收到的消息前加上 [月-日 时:分]，让 Agent 知道话是什么时候说的。",
+    },
+    {
+        "name": "display_timezone",
+        "label": "时间显示时区",
+        "type": "text",
+        "placeholder": "Asia/Shanghai",
+        "required": False,
+        "help": "消息时间戳与聊天记录查询使用的时区（IANA 名称，如 Asia/Shanghai、UTC）；留空使用服务器本地时区。",
+    },
+    {
+        "name": "history_enabled",
+        "label": "保存聊天记录",
+        "type": "switch",
+        "required": False,
+        "help": (
+            "默认开启：把收到和发出的消息写入本机 SQLite（仅本机文件，不上传），"
+            "Agent 可通过 onebot11_query_history 工具按时间、关键词、QQ 号检索，重启不丢。"
+            "关闭后不再记录，已有记录文件保留不动。"
+        ),
+    },
+    {
+        "name": "history_retention_days",
+        "label": "聊天记录保留天数",
+        "type": "number",
+        "placeholder": "30",
+        "required": False,
+        "help": "超过天数的记录会被自动清理（默认 30）；0 表示不按时间清理。每个会话另有条数上限，防止文件无限增长。",
+    },
+    {
+        "name": "media_fetch_enabled",
+        "label": "下载图片交给模型",
+        "type": "switch",
+        "required": False,
+        "help": (
+            "默认开启：收到图片时由插件先下载（带浏览器标识；失败再向 NapCat 要原图），"
+            "模型拿到的是图片本身而不是可能已过期的链接。需要所用模型支持图片输入；"
+            "只处理会交给 Agent 的消息，普通群聊闲话不会触发下载。"
+        ),
+    },
+    {
+        "name": "media_max_mb",
+        "label": "单个媒体大小上限（MB）",
+        "type": "number",
+        "placeholder": "8",
+        "required": False,
+        "help": "超过该大小的图片/语音不会下载（默认 8，范围 0.5–50）。",
+    },
+    {
+        "name": "media_allowed_hosts",
+        "label": "额外可信媒体域名",
+        "type": "text",
+        "placeholder": "逗号分隔，例如：img.example.com",
+        "required": False,
+        "help": (
+            "插件只会从 QQ 官方图片域名、NapCat 自身地址以及这里列出的域名下载媒体，"
+            "避免被群里的陌生人诱导访问内网地址。NapCat 返回了其他域名的图片链接时才需要补充。"
+        ),
+    },
+    {
+        "name": "asr_base_url",
+        "label": "语音转文字服务地址",
+        "type": "text",
+        "placeholder": "https://api.openai.com/v1",
+        "required": False,
+        "help": (
+            "兼容 OpenAI 的语音转写接口（POST {地址}/audio/transcriptions）。留空时使用下方的 NapCat 自带转写；"
+            "填写后，语音会先上传到该服务转成文字再交给 Agent，识别质量通常更好。"
+            "注意：语音内容会上传到该服务，请选择可信的服务商或自建服务。"
+        ),
+    },
+    {
+        "name": "asr_api_key",
+        "label": "语音转文字密钥",
+        "type": "password",
+        "placeholder": "服务商提供的 API Key",
+        "required": False,
+        "help": "仅作为请求头发送给上面的转写服务；自建且无需鉴权时可留空。",
+    },
+    {
+        "name": "asr_model",
+        "label": "语音识别模型",
+        "type": "text",
+        "placeholder": "whisper-1",
+        "required": False,
+        "help": "转写服务使用的模型名（默认 whisper-1）；各服务商的名称不同，请按其文档填写。",
+    },
+    {
+        "name": "asr_language",
+        "label": "语音语言",
+        "type": "text",
+        "placeholder": "zh",
+        "required": False,
+        "help": "提示语言（ISO 639-1，如 zh、en），默认 zh；留空则由服务自动判断。",
+    },
+    {
+        "name": "asr_napcat_fallback",
+        "label": "使用 NapCat 自带语音转文字",
+        "type": "switch",
+        "required": False,
+        "help": (
+            "默认开启：未配置上面的转写服务、或该服务失败时，改用 QQ 自带的语音转文字（经 NapCat 的 fetch_ptt_text 接口，"
+            "免费、语音不会发给第三方）。需要消息仍在 NapCat 缓存里且 QQ 能识别；不需要时可关闭，此时未配置转写服务的语音只显示为“[语音]”。"
+        ),
     },
     {
         "name": "reply_with_quote",
@@ -3205,6 +4718,22 @@ _FIELDS: list[dict[str, Any]] = [
         "help": "默认开启：断线期间的主动消息进入队列（已持久化，重启不丢），恢复连接后自动补发。",
     },
     {
+        "name": "send_rate_limit_count",
+        "label": "全通道发送限速（条）",
+        "type": "number",
+        "placeholder": "20",
+        "required": False,
+        "help": "整个通道在“限速窗口”内最多发送的消息条数（默认 20，每 60 秒），0 表示不限。QQ 对高频发送敏感，过快可能触发风控。",
+    },
+    {
+        "name": "send_rate_limit_per_chat_count",
+        "label": "单个群/用户发送限速（条）",
+        "type": "number",
+        "placeholder": "0",
+        "required": False,
+        "help": "每个群或每个私聊对象在限速窗口内最多收到的消息条数，0 表示不单独限制（默认）。建议设为 5–10：避免一个热门群把全通道额度用光，也防止对单个群刷屏。超出时主动发送会立即提示稍后再试，被动回复会自动延后。",
+    },
+    {
         "name": "media_allowed_dirs",
         "label": "本地媒体目录白名单",
         "type": "text",
@@ -3213,7 +4742,20 @@ _FIELDS: list[dict[str, Any]] = [
         "help": "主动发送的图片等若给的是服务器本地文件路径，只允许这些目录内的文件（自动转 base64，单文件 ≤ 10 MB，图片需为 PNG/JPEG/GIF/WEBP/BMP）。留空表示禁止本地文件，只能使用 http(s) 地址。",
     },
     {
+        "name": "admin_users",
+        "label": "管理员 QQ 号",
+        "type": "text",
+        "placeholder": "逗号分隔 QQ 号，例如：10001,10002；留空 = 不允许",
+        "required": False,
+        "help": (
+            "只有这里列出的 QQ 号发来的指令，机器人才会执行“禁言 / 解除禁言 / 改群名片”等管理操作"
+            "（机器人自己得是群管理员）；其他人即使让 Agent 去做也会被拒绝。留空表示完全关闭这类操作。"
+            "撤回机器人自己发的消息、表情回应等无风险操作不受此限制。"
+        ),
+    },
+    {
         "name": "multi_account",
+        "showWhen": {"field": "connection_mode", "equals": "reverse"},
         "label": "多账号（反向）",
         "type": "switch",
         "required": False,
